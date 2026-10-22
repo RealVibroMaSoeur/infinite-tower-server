@@ -1,5 +1,5 @@
 'use strict';
-// Infinite Tower CO-OP v0.2 — authoritative 2-player combat, no paid services.
+// Infinite Tower CO-OP v0.3.2 — authoritative 2-player combat, no paid services.
 // Rooms and runs are in RAM. Render free instance restarts can erase active runs.
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -39,7 +39,7 @@ function newCode() {
 }
 function send(ws, msg) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
 function broadcast(room, msg) { for (const p of room.players) if (p) send(p.ws, msg); }
-function peers(room) { return room.players.map((p, slot) => p ? ({ slot, connected: !!p.ws, ready: !!p.ready, name: p.name }) : null); }
+function peers(room) { return room.players.map((p, slot) => p ? ({ slot, connected: !!p.ws, ready: !!p.ready, name: p.name, maxMap: p.maxMap, maxDiff: p.maxDiff, voteMap: p.voteMap, voteDiff: p.voteDiff }) : null); }
 function status(room) { broadcast(room, { type: 'room_state', roomCode: room.code, players: peers(room), started: room.started, ended: room.ended }); }
 function error(ws, message) { send(ws, { type: 'error', message }); }
 function sanitizeStats(data) {
@@ -77,6 +77,9 @@ function attach(ws, room, slot) {
 function createPlayer(ws, data) {
   return { ws: null, token: crypto.randomBytes(24).toString('hex'), ready: false,
     name: String(data.name || 'Player').slice(0, 24),
+    maxMap: Math.round(clamp(data.unlocked?.maxMap ?? 1, 1, 10)),
+    maxDiff: Math.round(clamp(data.unlocked?.maxDiff ?? 0, 0, 4)),
+    voteMap: 1, voteDiff: 0,
     stats: sanitizeStats(data.stats), maxSpeed: Math.round(clamp(data.maxSpeed ?? 1, 1, 5)) };
 }
 function startGame(room, map, diff) {
@@ -244,6 +247,15 @@ function onMessage(ws, msg) {
   const room = ws.room;
   if (!room || room.players[ws.slot]?.ws !== ws) return error(ws, 'Join a room first');
   room.lastActive = Date.now();
+  if (type === 'vote') {
+    if (room.started) return error(ws, 'Already started');
+    const p = room.players[ws.slot];
+    const map = Number(msg.map), diff = Number(msg.diff);
+    if (!Number.isInteger(map) || !Number.isInteger(diff) || map < 1 || map > p.maxMap || diff < 0 || diff > p.maxDiff)
+      return error(ws, 'Stage or difficulty not unlocked');
+    p.voteMap = map; p.voteDiff = diff;
+    return status(room);
+  }
   if (type === 'ready') {
     if (room.started) return error(ws, 'Already started');
     room.players[ws.slot].ready = !!msg.ready;
@@ -254,7 +266,32 @@ function onMessage(ws, msg) {
     if (ws.slot !== 0) return error(ws, 'Only host can start');
     if (room.started) return error(ws, 'Already started');
     if (!room.players.every(p => p?.ws && p.ready)) return error(ws, 'Both players must be connected and ready');
-    startGame(room, msg.map, msg.diff);
+    startGame(room, Math.max(...room.players.map(p => p.voteMap)), Math.max(...room.players.map(p => p.voteDiff)));
+    return;
+  }
+  // Return both players to the same lobby for a rematch, with no APK update.
+  if (type === 'rematch') {
+    if (!room.started || !room.ended) return error(ws, 'Finish the current run first');
+    const p = room.players[ws.slot];
+    if (msg.diff !== undefined) {
+      const selected = Number(msg.diff);
+      if (!Number.isInteger(selected) || selected < 0 || selected > p.maxDiff)
+        return error(ws, 'Difficulty not unlocked');
+      p.voteDiff = selected;
+    }
+    const map = room.game.map;
+    const diff = room.game.diff;
+    room.started = false; room.ended = false; room.game = null;
+    for (const player of room.players) if (player) player.ready = false;
+    broadcast(room, { type: 'back_to_lobby', map, diff });
+    status(room);
+    return;
+  }
+  if (type === 'leave_room') {
+    // A quit closes this private room for both players; no orphaned host slot.
+    broadcast(room, { type: 'room_closed', message: 'A player left the lobby' });
+    for (const p of room.players) if (p?.ws) { p.ws.room = null; p.ws.slot = null; }
+    rooms.delete(room.code);
     return;
   }
   if (type === 'upgrade') {
@@ -285,7 +322,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.2.0', rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.3.2', rooms: rooms.size }));
   } else { res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' })); }
 });
 const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_BYTES });
@@ -334,5 +371,5 @@ setInterval(() => {
     }
   }
 }, TICK_MS).unref();
-if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Infinite Tower CO-OP v0.2 listening on ${PORT}`));
+if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Infinite Tower CO-OP v0.3 listening on ${PORT}`));
 module.exports = { server, rooms, onMessage, tick, startGame, snapshot, upgrade, finish, sanitizeStats };
