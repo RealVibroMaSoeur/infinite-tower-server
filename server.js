@@ -1,5 +1,5 @@
 'use strict';
-// Infinite Tower CO-OP v0.3.2 — authoritative 2-player combat, no paid services.
+// Infinite Tower CO-OP v0.3.4 — authoritative 2-player combat, no paid services.
 // Rooms and runs are in RAM. Render free instance restarts can erase active runs.
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -269,7 +269,23 @@ function onMessage(ws, msg) {
     startGame(room, Math.max(...room.players.map(p => p.voteMap)), Math.max(...room.players.map(p => p.voteDiff)));
     return;
   }
-  // Return both players to the same lobby for a rematch, with no APK update.
+  // Replay immediately: no lobby/READY interruption for either player.
+  if (type === 'play_again') {
+    if (!room.started || !room.ended || !room.game) return error(ws, 'Finish the current run first');
+    const { map, diff } = room.game;
+    startGame(room, map, diff);
+    return;
+  }
+  // Difficulty change returns both players to the CO-OP lobby to vote again.
+  if (type === 'return_to_lobby') {
+    if (!room.started || !room.ended || !room.game) return error(ws, 'Finish the current run first');
+    room.started = false; room.ended = false; room.game = null;
+    for (const player of room.players) if (player) player.ready = false;
+    broadcast(room, { type: 'back_to_lobby' });
+    status(room);
+    return;
+  }
+  // Backward compatibility with the previous test client.
   if (type === 'rematch') {
     if (!room.started || !room.ended) return error(ws, 'Finish the current run first');
     const p = room.players[ws.slot];
@@ -322,7 +338,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.3.2', rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.3.4', rooms: rooms.size }));
   } else { res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' })); }
 });
 const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_BYTES });
