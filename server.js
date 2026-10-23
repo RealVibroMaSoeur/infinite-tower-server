@@ -1,5 +1,5 @@
 'use strict';
-// Infinite Tower CO-OP v0.3.4 — authoritative 2-player combat, no paid services.
+// Infinite Tower CO-OP v0.4.0 — authoritative 2-player combat, no paid services.
 // Rooms and runs are in RAM. Render free instance restarts can erase active runs.
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -14,16 +14,7 @@ const TYPES = [
   { name: 'Ranged', hp: 1.4, speed: .9, color: '#d39bff' },
   { name: 'Boss', hp: 30, speed: .5, color: '#ff607e' }
 ];
-const UPGRADES = [
-  { key: 'damage', name: 'Damage', cost: 20, growth: 1.16 },
-  { key: 'speed', name: 'Attack Speed', cost: 25, growth: 1.18 },
-  { key: 'hp', name: 'Core HP', cost: 20, growth: 1.17 },
-  { key: 'regen', name: 'Regeneration', cost: 30, growth: 1.19 },
-  { key: 'crit', name: 'Critical Chance', cost: 50, growth: 1.23 },
-  { key: 'multi', name: 'Multishot', cost: 300, growth: 3 },
-  { key: 'cash', name: 'Cash / Kill', cost: 35, growth: 1.22 },
-  { key: 'range', name: 'Range', cost: 40, growth: 1.2 }
-];
+const UPGRADES = [{"name":"Damage","cost":20,"growth":1.16,"cat":"Offense","max":1000},{"name":"Attack Speed","cost":25,"growth":1.18,"cat":"Offense","max":1000},{"name":"Max HP","cost":20,"growth":1.17,"cat":"Defense","max":1000},{"name":"Regeneration","cost":30,"growth":1.19,"cat":"Defense","max":1000},{"name":"Critical Chance","cost":50,"growth":1.23,"cat":"Offense","max":1000},{"name":"Multishot","cost":300,"growth":3.0,"cat":"Offense","max":4},{"name":"Cash / Kill","cost":35,"growth":1.22,"cat":"Economy","max":1000},{"name":"Range","cost":40,"growth":1.2,"cat":"Offense","max":1000},{"name":"Critical Damage","cost":65,"growth":1.2,"cat":"Offense","max":1000},{"name":"Rapid Fire","cost":100,"growth":1.23,"cat":"Offense","max":1000},{"name":"Bounce Shot","cost":400,"growth":1.35,"cat":"Offense","max":5},{"name":"Armor Penetration","cost":650,"growth":1.32,"cat":"Offense","max":5},{"name":"Defense %","cost":55,"growth":1.22,"cat":"Defense","max":1000},{"name":"Absolute Defense","cost":35,"growth":1.18,"cat":"Defense","max":1000},{"name":"Thorns","cost":130,"growth":1.28,"cat":"Defense","max":1},{"name":"Lifesteal","cost":450,"growth":1.32,"cat":"Offense","max":1},{"name":"Energy Shield","cost":900,"growth":1.5,"cat":"Defense","max":1},{"name":"Cash / Wave","cost":70,"growth":1.19,"cat":"Economy","max":1000},{"name":"Coin / Kill","cost":80,"growth":1.22,"cat":"Economy","max":1000},{"name":"Coin / Wave","cost":85,"growth":1.2,"cat":"Economy","max":1000},{"name":"Interest","cost":120,"growth":1.3,"cat":"Economy","max":2},{"name":"XP / Kill","cost":110,"growth":1.25,"cat":"Economy","max":1000},{"name":"Knockback","cost":180,"growth":1.25,"cat":"Defense","max":1000},{"name":"Target Priority","cost":250,"growth":1.35,"cat":"Offense","max":5},{"name":"Burst Chance","cost":300,"growth":1.25,"cat":"Offense","max":1000},{"name":"Burst Count","cost":1200,"growth":1.8,"cat":"Offense","max":4},{"name":"Retired Burst Damage","cost":450,"growth":1.3,"cat":"Retired","max":1000},{"name":"XP / Wave","cost":130,"growth":1.24,"cat":"Economy","max":1000},{"name":"Startup Cash","cost":85,"growth":1.2,"cat":"Economy","max":1000},{"name":"Offense Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Defense Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Utility Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Economy Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000}];
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const DISCONNECT_GRACE_MS = 60_000;
 const IDLE_ROOM_MS = 15 * 60_000;
@@ -39,7 +30,7 @@ function newCode() {
 }
 function send(ws, msg) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
 function broadcast(room, msg) { for (const p of room.players) if (p) send(p.ws, msg); }
-function peers(room) { return room.players.map((p, slot) => p ? ({ slot, connected: !!p.ws, ready: !!p.ready, name: p.name, maxMap: p.maxMap, maxDiff: p.maxDiff, voteMap: p.voteMap, voteDiff: p.voteDiff }) : null); }
+function peers(room) { return room.players.map((p, slot) => p ? ({ slot, connected: !!p.ws, ready: !!p.ready, forfeited:!!p.forfeited, name: p.name, maxMap: p.maxMap, maxDiff: p.maxDiff, voteMap: p.voteMap, voteDiff: p.voteDiff, maxSpeed:p.maxSpeed }) : null); }
 function status(room) { broadcast(room, { type: 'room_state', roomCode: room.code, players: peers(room), started: room.started, ended: room.ended }); }
 function error(ws, message) { send(ws, { type: 'error', message }); }
 function sanitizeStats(data) {
@@ -64,6 +55,7 @@ function roomCreate() {
 }
 function attach(ws, room, slot) {
   const p = room.players[slot];
+  if (p.forfeited) return error(ws, 'You voluntarily quit this run; reconnect disabled');
   if (p.ws && p.ws !== ws) p.ws.close(4001, 'Reconnected elsewhere');
   p.ws = ws;
   ws.room = room; ws.slot = slot;
@@ -79,35 +71,49 @@ function createPlayer(ws, data) {
     name: String(data.name || 'Player').slice(0, 24),
     maxMap: Math.round(clamp(data.unlocked?.maxMap ?? 1, 1, 10)),
     maxDiff: Math.round(clamp(data.unlocked?.maxDiff ?? 0, 0, 4)),
+    initialUpgrades:Array.isArray(data.initialUpgrades)?data.initialUpgrades.slice(0,UPGRADES.length).map((n,i)=>Math.round(clamp(n,0,UPGRADES[i].max))):Array(UPGRADES.length).fill(0),
+    startingCash:clamp(data.startingCash??80,80,1e7),
+    unlockByMap:(data.unlocked?.byMap&&typeof data.unlocked.byMap==='object'&&!Array.isArray(data.unlocked.byMap))?data.unlocked.byMap:null,
+    forfeited:false, allowedUpgrades:Array.isArray(data.unlocked?.allowedUpgrades)?data.unlocked.allowedUpgrades.filter(i=>Number.isInteger(i)&&i>=0&&i<UPGRADES.length):null,
     voteMap: 1, voteDiff: 0,
-    stats: sanitizeStats(data.stats), maxSpeed: Math.round(clamp(data.maxSpeed ?? 1, 1, 5)) };
+    stats: sanitizeStats(data.stats), maxSpeed: Math.round(clamp(data.maxSpeed ?? 1, 1, 10)) };
 }
 function startGame(room, map, diff) {
   const players = room.players;
   const average = {};
   for (const k of Object.keys(players[0].stats)) average[k] = (players[0].stats[k] + players[1].stats[k]) / 2;
+  const initialHp = average.hp * (1 + ((players[0].initialUpgrades[2]||0)+(players[1].initialUpgrades[2]||0))*.12/2);
   const game = {
     map: Math.round(clamp(map ?? 1, 1, 10)), diff: Math.round(clamp(diff ?? 0, 0, 4)),
     wave: 1, waveTime: 0, elapsed: 0, spawned: 0, kills: 0,
-    hp: average.hp, maxhp: average.hp, gold: 0, diamonds: 0, xp: 0,
+    hp: initialHp, maxhp: initialHp, shields:0, gold: 0, diamonds: 0, xp: 0,
     speed: 1, stats: average, nextId: 1, enemies: [], bullets: [],
-    players: players.map((p, slot) => ({ slot, cash: 80, up: Array(8).fill(0), shot: 0, damage: 0, kills: 0 })),
+    players: players.map((p, slot) => ({ slot, cash: p.startingCash, up: [...p.initialUpgrades], shot: 0, damage: 0, kills: 0, shield:0, freeTick:[0,0,0,0] })),
     lastTime: Date.now(), result: null
   };
+  game.shields = Math.floor((game.players[0].up[16]+game.players[1].up[16])/5);
   room.started = true; room.ended = false; room.game = game;
   broadcast(room, { type: 'game_started', roomCode: room.code, startedAt: Date.now(), map: game.map, diff: game.diff });
   broadcast(room, { type: 'game_state', ...snapshot(game) });
   status(room);
 }
 function towerStats(g, p) {
+  // Indexed according to the SAME UPS table as the solo game.
   return {
-    dmg: (g.stats.damage + p.up[0] * 5),
-    speed: g.stats.attackSpeed + p.up[1] * .16,
-    range: g.stats.range * (1 + p.up[7] * .08),
-    crit: Math.min(.95, g.stats.critChance + p.up[4] * .025),
-    critDamage: g.stats.critDamage,
-    multi: 1 + Math.min(5, p.up[5]),
-    regen: p.up[3] * .6
+    dmg:g.stats.damage + p.up[0]*5,
+    speed:g.stats.attackSpeed+p.up[1]*.16+p.up[9]*.07,
+    range:g.stats.range*(1+p.up[7]*.08),
+    crit:Math.min(.95,g.stats.critChance+p.up[4]*.025),
+    critDamage:g.stats.critDamage+p.up[8]*.15,
+    multi:1+Math.min(5,p.up[5]),
+    regen:p.up[3]*.6,
+    defense:Math.min(.75,p.up[12]*.018),
+    absolute:p.up[13]*.35,
+    thorns:p.up[14]*.025,
+    lifesteal:p.up[15]*.007,
+    knockback:p.up[22]*.3,
+    burstChance:Math.min(.75,p.up[24]*.02),
+    burstCount:Math.min(6,2+p.up[25])
   };
 }
 function spawn(g) {
@@ -131,8 +137,8 @@ function killEnemy(g, enemy, killerSlot) {
   const earn = Math.max(1, Math.floor((2 + g.wave * .2) * mult));
   // Full income for both players, not a split. Personal cash upgrades apply individually.
   for (const p of g.players) p.cash += earn * (1 + p.up[6] * .12);
-  g.gold += earn;
-  g.xp += (2 + g.wave * .15) * Math.pow(1.65, g.map - 1) * Math.pow(3, g.diff) * (enemy.type === 4 ? 30 : 1);
+  g.gold += earn * (1 + (g.players[0].up[18]+g.players[1].up[18])*.06/2);
+  g.xp += (2 + g.wave * .15) * Math.pow(1.65, g.map - 1) * Math.pow(3, g.diff) * (enemy.type === 4 ? 30 : 1) * (1+(g.players[0].up[21]+g.players[1].up[21])*.04/2);
   if (Math.random() < .001 * (enemy.type === 4 ? 20 : 1)) g.diamonds++;
 }
 function tick(g, dt) {
@@ -148,10 +154,13 @@ function tick(g, dt) {
     if (p.shot < 1 / st.speed) continue;
     p.shot = 0;
     const targets = g.enemies.filter(e => e.hp > 0 && Math.hypot(e.x - ox, e.y) < st.range)
-      .sort((a, b) => Math.hypot(a.x - ox, a.y) - Math.hypot(b.x - ox, b.y));
+      .sort((a, b) => p.up[23]>0 && a.type!==b.type && (a.type===4||b.type===4) ? (b.type===4?1:-1) : Math.hypot(a.x-ox,a.y)-Math.hypot(b.x-ox,b.y));
     for (const enemy of targets.slice(0, st.multi)) {
-      const damage = st.dmg * (Math.random() < st.crit ? st.critDamage : 1);
+      const damage = st.dmg * (Math.random() < st.crit ? st.critDamage : 1) * (1+p.up[11]*.03);
       enemy.hp -= damage; p.damage += damage;
+      g.hp=Math.min(g.maxhp,g.hp+damage*st.lifesteal);
+      if(st.knockback && Math.random()<Math.min(.6,p.up[22]*.04)){const d=Math.hypot(enemy.x,enemy.y)||1;enemy.x+=enemy.x/d*st.knockback;enemy.y+=enemy.y/d*st.knockback;}
+      if(Math.random()<st.burstChance){enemy.hp-=damage*Math.max(0,st.burstCount-1)*.35;p.damage+=damage*Math.max(0,st.burstCount-1)*.35;}
       g.bullets.push({ x: ox, y: 0, tx: enemy.x, ty: enemy.y, slot: p.slot, life: .22 });
       if (enemy.hp <= 0) killEnemy(g, enemy, p.slot);
     }
@@ -166,7 +175,13 @@ function tick(g, dt) {
       enemy.shot += dt;
       if (enemy.shot >= (enemy.type === 3 ? 1.6 : 1)) {
         enemy.shot = 0;
-        g.hp -= enemy.atk;
+        const averageDef=(towerStats(g,g.players[0]).defense+towerStats(g,g.players[1]).defense)/2;
+        const averageAbs=(towerStats(g,g.players[0]).absolute+towerStats(g,g.players[1]).absolute)/2;
+        let damage=Math.max(0,enemy.atk*(1-averageDef)-averageAbs);
+        if(g.shields>0 && damage>0){g.shields--;damage=0;}
+        g.hp-=damage;
+        const thorn=(towerStats(g,g.players[0]).thorns+towerStats(g,g.players[1]).thorns)/2;
+        if(thorn>0){enemy.hp-=enemy.max*thorn;if(enemy.hp<=0)killEnemy(g,enemy,0);}
       }
     }
   }
@@ -174,8 +189,19 @@ function tick(g, dt) {
   if (g.hp <= 0) return 'core_destroyed';
   if (g.spawned >= targetCount && !g.enemies.length) {
     g.wave++; g.waveTime = 0; g.spawned = 0;
-    for (const p of g.players) p.cash += 5 + g.wave * .4;
-    g.xp += 20 + g.wave * 2;
+    for(const p of g.players){
+      p.cash+=5+g.wave*.4+p.up[17]*.09*(5+g.wave*.4)+p.up[20]*Math.min(1000,p.cash)*.01;
+      // Free-upgrade utility: one roll in each category each wave.
+      for(const [idx,cat] of [[29,'Offense'],[30,'Defense'],[31,'Utility'],[32,'Economy']]){
+        if(Math.random()<Math.min(.75,p.up[idx]*.01)){
+          const options=UPGRADES.map((u,i)=>({u,i})).filter(x=>x.u.cat===cat&&x.i!==idx&&x.i!==26&&x.i!==28&&p.up[x.i]<x.u.max);
+          if(options.length){const pick=options[Math.floor(Math.random()*options.length)];p.up[pick.i]++;if(pick.i===2){const gain=g.maxhp*.12;g.maxhp+=gain;g.hp+=gain;}}
+        }
+      }
+    }
+    g.gold+=2*(g.players[0].up[19]+g.players[1].up[19])/2;
+    g.xp+=(20+g.wave*2)*(1+(g.players[0].up[27]+g.players[1].up[27])*.1/2);
+    g.shields=Math.floor((g.players[0].up[16]+g.players[1].up[16])/5);
     if (g.wave % 10 === 0) g.diamonds++;
     if (g.wave >= 5000) return 'max_wave';
   }
@@ -206,16 +232,21 @@ function finish(room, reason) {
   broadcast(room, { type: 'game_over', ...result });
   status(room);
 }
-function upgrade(room, slot, index) {
-  const g = room.game, p = g.players[slot], up = UPGRADES[index];
-  if (!up) return false;
-  const level = p.up[index];
-  if (level >= (index === 5 ? 5 : 1000)) return false;
-  const cost = Math.ceil(up.cost * Math.pow(up.growth, level));
-  if (!Number.isFinite(cost) || p.cash < cost) return false;
-  p.cash -= cost; p.up[index]++;
-  if (index === 2) { const gain = g.maxhp * .12; g.maxhp += gain; g.hp += gain; }
-  return true;
+function upgrade(room, slot, index, batch=1) {
+  const g=room.game,p=g.players[slot],def=UPGRADES[index],owner=room.players[slot];
+  if(!def || def.cat==='Retired'||index===28 || (owner.allowedUpgrades && !owner.allowedUpgrades.includes(index)))return false;
+  if(![1,10,100,'max'].includes(batch))batch=1;
+  const times=batch==='max'?1000:batch;
+  let bought=0;
+  for(let n=0;n<times;n++){
+    if(p.up[index]>=def.max)break;
+    const cost=Math.ceil(def.cost*Math.pow(def.growth,p.up[index]));
+    if(!Number.isFinite(cost)||p.cash<cost)break;
+    p.cash-=cost;p.up[index]++;bought++;
+    if(index===2){const gain=g.maxhp*.12;g.maxhp+=gain;g.hp+=gain;}
+    if(index===16 && p.up[index]%5===0)g.shields++;
+  }
+  return bought>0;
 }
 function onMessage(ws, msg) {
   if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return error(ws, 'Invalid message');
@@ -241,7 +272,7 @@ function onMessage(ws, msg) {
     const room = rooms.get(String(msg.roomCode || '').trim().toUpperCase());
     if (!room) return error(ws, 'Room not found');
     const slot = room.players.findIndex(p => p && p.token === String(msg.reconnectToken || ''));
-    if (slot < 0) return error(ws, 'Invalid reconnect token');
+    if (slot < 0 || room.players[slot]?.forfeited) return error(ws, 'Invalid reconnect token');
     return attach(ws, room, slot);
   }
   const room = ws.room;
@@ -251,7 +282,7 @@ function onMessage(ws, msg) {
     if (room.started) return error(ws, 'Already started');
     const p = room.players[ws.slot];
     const map = Number(msg.map), diff = Number(msg.diff);
-    if (!Number.isInteger(map) || !Number.isInteger(diff) || map < 1 || map > p.maxMap || diff < 0 || diff > p.maxDiff)
+    if (!Number.isInteger(map) || !Number.isInteger(diff) || map < 1 || map > p.maxMap || diff < 0 || diff > p.maxDiff || (p.unlockByMap && !Array.isArray(p.unlockByMap[map])) || (p.unlockByMap && !p.unlockByMap[map].includes(diff)))
       return error(ws, 'Stage or difficulty not unlocked');
     p.voteMap = map; p.voteDiff = diff;
     return status(room);
@@ -303,23 +334,41 @@ function onMessage(ws, msg) {
     status(room);
     return;
   }
-  if (type === 'leave_room') {
-    // A quit closes this private room for both players; no orphaned host slot.
-    broadcast(room, { type: 'room_closed', message: 'A player left the lobby' });
-    for (const p of room.players) if (p?.ws) { p.ws.room = null; p.ws.slot = null; }
-    rooms.delete(room.code);
+  if(type === 'quit_game') {
+    // Voluntary surrender. The quitter's token is permanently revoked.
+    const p=room.players[ws.slot];
+    p.forfeited=true;p.token=crypto.randomBytes(24).toString('hex');p.ready=false;
+    send(ws,{type:'voluntary_quit_confirmed'});
+    const slot=ws.slot;
+    p.ws=null;ws.room=null;ws.slot=null;
+    status(room);
+    // The teammate's run and both automatic towers continue normally.
+    if(room.players.every(x=>!x?.ws))room.bothGoneAt=Date.now();
+    else room.bothGoneAt=null;
     return;
+  }
+  if(type === 'leave_room') {
+    if(room.started&&!room.ended){
+      return error(ws,'During a run use quit_game with confirmation');
+    }
+    if(room.started&&room.ended){
+      const p=room.players[ws.slot];p.forfeited=true;p.token=crypto.randomBytes(24).toString('hex');
+      send(ws,{type:'voluntary_quit_confirmed'});p.ws=null;ws.room=null;ws.slot=null;
+      status(room);return;
+    }
+    broadcast(room,{type:'room_closed',message:'Lobby closed'});
+    for(const p of room.players)if(p?.ws){p.ws.room=null;p.ws.slot=null;}
+    rooms.delete(room.code);return;
   }
   if (type === 'upgrade') {
     if (!room.started || room.ended) return error(ws, 'No active game');
     const index = Number(msg.index);
     if (!Number.isInteger(index) || index < 0 || index >= UPGRADES.length) return error(ws, 'Invalid upgrade');
-    if (!upgrade(room, ws.slot, index)) return error(ws, 'Not enough cash or max level');
+    if (!upgrade(room, ws.slot, index, msg.batch)) return error(ws, 'Not enough cash or max level');
     broadcast(room, { type: 'game_state', ...snapshot(room.game) });
     return;
   }
   if (type === 'set_speed') {
-    if (ws.slot !== 0) return error(ws, 'Only host can set speed');
     if (!room.started || room.ended) return error(ws, 'No active game');
     const maxSpeed = Math.min(...room.players.map(p => p.maxSpeed));
     const speed = Number(msg.speed);
@@ -329,7 +378,7 @@ function onMessage(ws, msg) {
   }
   if (type === 'end_run') {
     if (!room.started || room.ended) return error(ws, 'No active game');
-    if (ws.slot !== 0) return error(ws, 'Only host can end the run');
+    // Surviving player may end the run if their partner forfeits.
     return finish(room, 'ended_by_host');
   }
   error(ws, 'Unknown message type');
@@ -338,7 +387,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.3.4', rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.4.0', rooms: rooms.size }));
   } else { res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' })); }
 });
 const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_BYTES });
@@ -387,5 +436,5 @@ setInterval(() => {
     }
   }
 }, TICK_MS).unref();
-if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Infinite Tower CO-OP v0.3 listening on ${PORT}`));
+if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Infinite Tower CO-OP v0.4 listening on ${PORT}`));
 module.exports = { server, rooms, onMessage, tick, startGame, snapshot, upgrade, finish, sanitizeStats };

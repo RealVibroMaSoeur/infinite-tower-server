@@ -1,8 +1,7 @@
 {
-  "name": "infinite-tower-server",
-  "version": "0.3.4",
+  "name": "infinite-tower-coop",
+  "version": "0.4.0",
   "private": true,
-  "description": "Serveur CO-OP avec combat synchronis\u00e9 Infinite Tower",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +10,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "ws": "^8.18.0"
   }
 }
