@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this), function() {
   'use strict';
 
-  const VERSION = '2.1.4-unified';
+  const VERSION = '2.1.5';
 
   const STARTER_UPGRADES = [0, 1, 2, 3, 4, 6, 7, 8, 12, 13, 17, 18, 19, 21, 27];
   const STARTER_UPGRADES_SET = new Set(STARTER_UPGRADES);
