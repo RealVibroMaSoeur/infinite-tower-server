@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this), function() {
   'use strict';
 
-  const VERSION = '2.1.4-unified';
+  const VERSION = '2.1.5';
 
   const STARTER_UPGRADES = [0, 1, 2, 3, 4, 6, 7, 8, 12, 13, 17, 18, 19, 21, 27];
   const STARTER_UPGRADES_SET = new Set(STARTER_UPGRADES);
@@ -263,8 +263,10 @@
     ['Bounce Shot Chance', 300, 1.25, 'Offense', 40],
     ['Rapid Fire Chance', 300, 1.25, 'Offense', 50],
     ['Life on Wave End', 350, 1.25, 'Defense', 50],
-    ['Startup Cash', 350, 1.25, 'Economy'],
-    ['Life on Wave End (Run)', 350, 1.25, 'Defense', 100]
+    ['Startup Cash', 150, 1.25, 'Economy'],
+    ['Life on Wave End (Run)', 350, 1.25, 'Defense', 100],
+    ['Overcrit Chance', 400, 1.25, 'Offense', 40],
+    ['Overcrit Damage', 500, 1.25, 'Offense', 40]
   ];
 
   const UPGRADES = Object.freeze(UPS.map((u, i) => Object.freeze({
@@ -281,7 +283,8 @@
     11: 100, 12: 10, 13: 5000, 14: 20, 15: 100, 16: 1, 17: 5000, 18: 5000, 19: 5000, 20: 10,
     21: 5000, 22: 30, 23: 0, 24: 20, 25: 4, 26: 0, 27: 5000, 28: 0,
     29: 50, 30: 50, 31: 50, 32: 50,
-    33: 0, 34: 0, 35: 20, 36: 20, 37: 50, 38: 50, 39: 500, 40: 0
+    33: 0, 34: 0, 35: 20, 36: 20, 37: 20, 38: 50, 39: 500, 40: 0,
+    41: 20, 42: 20
   });
 
   const LAB_CAPS = Object.freeze({
@@ -289,12 +292,13 @@
     11: 100, 12: 10, 13: 5000, 14: 20, 15: 100, 16: 1, 17: 5000, 18: 5000, 19: 5000, 20: 10,
     21: 5000, 22: 30, 23: 1, 24: 20, 25: 4, 26: 0, 27: 5000, 28: 0,
     29: 50, 30: 50, 31: 50, 32: 50,
-    33: 0, 34: 0, 35: 20, 36: 20, 37: 50, 38: 50, 39: 500, 40: 0
+    33: 0, 34: 0, 35: 20, 36: 20, 37: 20, 38: 50, 39: 500, 40: 0,
+    41: 20, 42: 20
   });
 
   // Canonical shared Workshop & Lab upgrade definitions per category (excluding Projectile Speed #33 and Lab-only Target Priority #23)
   const UNIFIED_CATEGORY_UPGRADES = Object.freeze({
-    Offense: Object.freeze([0, 1, 7, 4, 8, 24, 25, 5, 35, 9, 37, 10, 36, 11, 15]),
+    Offense: Object.freeze([0, 1, 7, 4, 8, 24, 25, 5, 35, 9, 37, 10, 36, 11, 15, 41, 42]),
     Defense: Object.freeze([2, 3, 12, 13, 14, 16, 38]),
     Utility: Object.freeze([22, 29, 30, 31, 32]),
     Economy: Object.freeze([6, 17, 18, 19, 20, 39, 21, 27])
@@ -369,10 +373,22 @@
     const discountApplied = isDiscountedBatchSize(requestedBatch);
     const curStart = Math.max(0, Math.floor(Number(startLevel) || 0));
     const cap = Number.isFinite(Number(maxCap)) ? Math.max(0, Math.floor(Number(maxCap))) : 100000;
+    const isMultiFixed = (requestedBatch === 10 || requestedBatch === 100 || requestedBatch === '10' || requestedBatch === '100');
     const limit = requestedBatch === 'max'
       ? Math.max(0, cap - curStart)
       : Math.max(1, Math.floor(Number(requestedBatch) || 1));
     const wallet = Number.isFinite(Number(availableCurrency)) ? Math.max(0, Number(availableCurrency)) : Infinity;
+
+    // Règle du tout ou rien pour x10 et x100 (#15) : si les niveaux restants avant cap sont inférieurs au lot demandé
+    if (isMultiFixed && (cap - curStart) < limit) {
+      return {
+        count: 0,
+        totalCost: 0,
+        rawCost: 0,
+        discountApplied: false,
+        allOrNothingFailed: true
+      };
+    }
 
     let count = 0;
     let totalCost = 0;
@@ -388,6 +404,17 @@
       totalCost += unitPrice;
       curLv++;
       count++;
+    }
+
+    // Règle du tout ou rien pour x10 et x100 (#15) : si le Cash ne permet pas de payer l'intégralité du lot
+    if (isMultiFixed && count < limit) {
+      return {
+        count: 0,
+        totalCost: 0,
+        rawCost: 0,
+        discountApplied: false,
+        allOrNothingFailed: true
+      };
     }
 
     return {
@@ -626,6 +653,33 @@
 
   function critRoll(chance, multiplier, rng = Math.random) {
     return criticalHit(chance, multiplier, typeof rng === 'function' ? rng() : Math.random());
+  }
+
+  // Refonte complète d'Overcrit (#24) :
+  // 1. Calcul du Crit normal.
+  // 2. Si le Crit échoue : dégâts normaux (multiplier = 1).
+  // 3. Si le Crit réussit : appliquer Crit Damage.
+  // 4. Seulement après un Crit réussi, calculer Overcrit Chance.
+  // 5. Si Overcrit réussit : appliquer Overcrit Damage par-dessus le Crit (Crit Dmg * Overcrit Dmg).
+  function calculateHitCritical(critChance, critMultiplier, overcritChance, overcritMultiplier, rng = Math.random) {
+    const roll1 = typeof rng === 'function' ? rng() : Math.random();
+    const cChance = Math.min(1, Math.max(0, Number(critChance) || 0));
+    const cMult = Math.max(1, Number(critMultiplier) || 1);
+
+    if (roll1 >= cChance) {
+      return { isCrit: false, isOvercrit: false, multiplier: 1, tiers: 0 };
+    }
+
+    // Premier Crit réussi ! Tirage du second palier Overcrit
+    const roll2 = typeof rng === 'function' ? rng() : Math.random();
+    const ocChance = Math.min(1, Math.max(0, Number(overcritChance) || 0));
+    const ocMult = Math.max(1, Number(overcritMultiplier) || 2);
+
+    if (ocChance > 0 && roll2 < ocChance) {
+      return { isCrit: true, isOvercrit: true, multiplier: cMult * ocMult, tiers: 2 };
+    }
+
+    return { isCrit: true, isOvercrit: false, multiplier: cMult, tiers: 1 };
   }
 
   function waveEndHealFraction(permanent, temporary) {
@@ -868,11 +922,13 @@
       burstChance: Math.min(1, Math.max(0, Math.min(40, wl(24) + wl(34) + lb('Burst Chance', 24) + ru(24) + ru(34)) * 0.025)),
       multishotChance: Math.min(1, Math.max(0, Math.min(40, wl(35) + lb('Multishot Chance', 35) + ru(35)) * 0.025)),
       bounceChance: Math.min(1, Math.max(0, Math.min(40, wl(36) + lb('Bounce Shot Chance', 36) + (isEffArray ? 0 : lb('Bounce Chance')) + ru(36)) * 0.025)),
-      rapidFireChance: Math.min(0.50, Math.max(0, (wl(37) + ru(37) + lb('Rapid Fire Chance', 37)) * 0.01)),
+      rapidFireChance: Math.min(1.0, Math.max(0, (wl(37) * 0.025) + (lb('Rapid Fire Chance', 37) * 0.025) + (ru(37) * 0.025))),
       rapidFireMultiplier: 1 + (wl(9) + ru(9) + lb('Rapid Fire', 9)) * 0.02,
       bounceCount: Math.min(5, Math.max(0, wl(10) + ru(10) + lb('Bounce Count', 10))),
       lifeOnWaveEnd: Math.min(0.5, Math.max(0, (wl(38) + lb('Life on Wave End', 38)) * 0.005)),
-      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 10
+      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 100,
+      overcritChance: Math.min(1.0, Math.max(0, (wl(41) * 0.025) + (lb('Overcrit Chance', 41) * 0.025) + (ru(41) * 0.025))),
+      overcritDamage: Math.min(6.0, 2.0 + (wl(42) + lb('Overcrit Damage', 42) + ru(42)) * 0.10)
     };
   }
 
@@ -898,21 +954,22 @@
     if (i === 40 && Number(waveEndHeal) >= 1 - 1e-9) return false;
     if (i === 35 && (effLv >= 40 || Number(effects.multishotChance) >= 1 - 1e-9)) return false;
     if (i === 36 && (effLv >= 40 || Number(effects.bounceChance) >= 1 - 1e-9)) return false;
-    if (i === 37 && (effLv >= 100 || Number(effects.rapidFireChance) >= 1 - 1e-9)) return false;
+    if (i === 37 && (effLv >= 40 || Number(effects.rapidFireChance) >= 1 - 1e-9)) return false;
+    if (i === 41 && (effLv >= 40 || Number(effects.overcritChance) >= 1 - 1e-9)) return false;
+    if (i === 42 && (effLv >= 40 || Number(effects.overcritDamage) >= 6.0 - 1e-9)) return false;
     if (i >= 29 && i <= 32 && effLv + (Number(freeUpgradeLabLevel) || 0) * 0.5 >= 100) return false;
     return true;
   }
 
-  // Shared CO-OP speed rule (Section 5):
+  // Shared CO-OP speed rule (Section 5, Modif #11):
   // - Minimum speed x1, no pause.
-  // - Any player can select a speed they have personally unlocked (1..playerMaxSpeed).
-  // - If currentSpeed > playerMaxSpeed and the player touches speed controls, speed is brought back
-  //   to playerMaxSpeed (the closest unlocked speed allowed by their profile).
-  // - A player cannot select a speed above their own playerMaxSpeed.
+  // - La vitesse maximale du lobby est déterminée par le déblocage le plus élevé parmi les joueurs présents.
   function resolveCoopSpeed(currentSpeed, playerMaxSpeed, requestedSpeed, action, roomMaxSpeed) {
     const cur = Math.max(1, Math.min(10, Math.round(Number(currentSpeed) || 1)));
     const myMax = Math.max(1, Math.min(10, Math.round(Number(playerMaxSpeed) || 1)));
-    const effectiveMax = roomMaxSpeed !== undefined ? Math.min(myMax, Math.max(1, Math.min(10, Math.round(Number(roomMaxSpeed) || myMax)))) : myMax;
+    const effectiveMax = roomMaxSpeed !== undefined
+      ? Math.max(myMax, Math.max(1, Math.min(10, Math.round(Number(roomMaxSpeed) || myMax))))
+      : myMax;
 
     if (action === 'minus' || action === 'plus') {
       if (cur > effectiveMax) {
@@ -1076,6 +1133,7 @@
   // Unified per-step combat engine used by both SOLO and CO-OP server
   function stepCombat(state, dt, hooks = {}) {
     if (!state || !(dt > 0)) return null;
+    const options = (typeof hooks === 'object' && hooks !== null) ? hooks : {};
     const rng = typeof hooks === 'function' ? hooks : (typeof hooks?.rng === 'function' ? hooks.rng : Math.random);
     const isMulti = Array.isArray(state.players) && state.players.length > 0;
     const towers = isMulti ? state.players : [state];
@@ -1110,10 +1168,12 @@
         burstChance: Math.min(1, Math.max(0, Math.min(40, (Number(effUp?.[24]) || 0) + (Number(effUp?.[34]) || 0)) * 0.025, (Number(baseEff.burstChance ?? baseEff.burstChanceBonus) || 0) + (Number(ru[24]) || 0) * 0.025)),
         multishotChance: Math.min(1, Math.max(0, Math.min(40, Number(effUp?.[35]) || 0) * 0.025, (Number(baseEff.multishotChance) || (Number(wl[35]) || 0) * 0.025) + (Number(ru[35]) || 0) * 0.025)),
         bounceChance: Math.min(1, Math.max(0, Math.min(40, Number(effUp?.[36]) || 0) * 0.025, (Number(baseEff.bounceChance) || (Number(wl[36]) || 0) * 0.025) + (Number(ru[36]) || 0) * 0.025)),
-        rapidFireChance: Math.min(1, Math.max(0, (Number(baseEff.rapidFireChance) || (Number(wl[37]) || 0) * 0.01) + (Number(ru[37]) || 0) * 0.01)),
+        rapidFireChance: Math.min(1.0, Math.max(0, (Number(baseEff.rapidFireChance) || (Number(wl[37]) || 0) * 0.025) + (Number(ru[37]) || 0) * 0.025)),
         rapidFireMultiplier: Math.max(1, Number(baseEff.rapidFireMultiplier ?? p.stats?.rapidFireMultiplier) || 1),
         bounceCount: Math.min(5, Math.max(0, Number(baseEff.bounceCount ?? p.stats?.bounceCount) || 0)),
-        lifeOnWaveEnd: Math.min(0.5, Math.max(0, Number(baseEff.lifeOnWaveEnd ?? baseEff.waveEndHeal ?? p.stats?.waveEndHeal) || (Number(wl[38]) || 0) * 0.005))
+        lifeOnWaveEnd: Math.min(0.5, Math.max(0, Number(baseEff.lifeOnWaveEnd ?? baseEff.waveEndHeal ?? p.stats?.waveEndHeal) || (Number(wl[38]) || 0) * 0.005)),
+        overcritChance: Math.min(1.0, Math.max(0, (Number(baseEff.overcritChance) || (Number(wl[41]) || 0) * 0.025) + (Number(ru[41]) || 0) * 0.025)),
+        overcritDamage: Math.max(2.0, Number(baseEff.overcritDamage || 2.0) + (Number(ru[42]) || 0) * 0.10)
       };
     };
 
@@ -1298,7 +1358,11 @@
       p.interestTimer = (Number(p.interestTimer) || 0) + dt;
       while (p.interestTimer >= 10) {
         p.interestTimer -= 10;
-        p.cash += interestCash(p.cash, effUp[20]) * (1 + (Number(boosters.interest) || 0));
+        const gained = interestCash(p.cash, effUp[20]) * (1 + (Number(boosters.interest) || 0));
+        p.cash += gained;
+        if (gained > 0 && typeof options.onInterestGain === 'function') {
+          options.onInterestGain({ x: ox, y: oy, slot: p.slot ?? 0, amount: Math.round(gained) });
+        }
       }
 
       p.hp = Math.min(p.maxhp, p.hp + st.regen * dt);
@@ -1341,7 +1405,7 @@
 
         for (let j = 0; j < targets.length; j++) {
           const e = targets[j];
-          const roll = criticalHit(st.crit, st.critDamage, rng());
+          const ocRoll = calculateHitCritical(st.crit, st.critDamage, eff.overcritChance || st.overcritChance || 0, eff.overcritDamage || st.overcritDamage || 2, rng);
           if (state.bullets.length < 2500) {
             state.bullets.push({
               x: ox,
@@ -1350,9 +1414,10 @@
               txX: e.x,
               txY: e.y,
               slot: p.slot ?? 0,
-              damage: st.dmg * roll.damageMultiplier,
-              crit: roll.crit,
-              critTiers: roll.tiers,
+              damage: st.dmg * ocRoll.multiplier,
+              crit: ocRoll.isCrit,
+              overcrit: ocRoll.isOvercrit,
+              critTiers: ocRoll.tiers,
               life: 0
             });
           }
@@ -1377,7 +1442,7 @@
             ? burst.target
             : selectTargets(state.enemies, ox, oy, st.range, 1)[0];
           if (e) {
-            const roll = criticalHit(st.crit, st.critDamage, rng());
+            const ocRoll = calculateHitCritical(st.crit, st.critDamage, eff.overcritChance || st.overcritChance || 0, eff.overcritDamage || st.overcritDamage || 2, rng);
             if (state.bullets.length < 2500) {
               state.bullets.push({
                 x: ox,
@@ -1386,9 +1451,10 @@
                 txX: e.x,
                 txY: e.y,
                 slot: p.slot ?? 0,
-                damage: burst.damage * roll.damageMultiplier,
-                crit: roll.crit,
-                critTiers: roll.tiers,
+                damage: burst.damage * ocRoll.multiplier,
+                crit: ocRoll.isCrit,
+                overcrit: ocRoll.isOvercrit,
+                critTiers: ocRoll.tiers,
                 life: 0
               });
             }
@@ -1485,6 +1551,16 @@
         shooter.damage = (shooter.damage || 0) + actualDamage;
         shooter.damageDealt = shooter.damageDealt || {};
         shooter.damageDealt.Direct = (shooter.damageDealt.Direct || 0) + actualDamage;
+
+        if (typeof options.onHitDamage === 'function') {
+          options.onHitDamage({
+            x: e.x,
+            y: e.y,
+            damage: actualDamage,
+            crit: !!bullet.crit,
+            overcrit: !!bullet.overcrit
+          });
+        }
 
         knockbackEnemy(e, effUp[22], rng);
 
@@ -1656,7 +1732,7 @@
     }
   }
 
-  function drawEnemy(ctx, e, zoom = 1, scale = 1) {
+  function drawEnemy(ctx, e, zoom = 1, scale = 1, showHpBars = false) {
     const type = e.type || 0;
     const isGiant = Boolean(e.isGiant || (e.giantFactor && e.giantFactor > 1));
     const rawSize = isGiant ? 20 : (type === 4 ? 17 : type === 2 ? 10 : 7);
@@ -1696,6 +1772,15 @@
       ctx.fillRect(e.x - barW / 2, barY, barW, 4);
       ctx.fillStyle = isGiant ? '#ffd45c' : '#ff7188';
       ctx.fillRect(e.x - barW / 2, barY, barW * Math.max(0, Math.min(1, e.hp / Math.max(1, e.max))), 4);
+    } else if (showHpBars) {
+      // Option Enemy HP Bars (#05)
+      const barW = Math.max(16, size * 2.2);
+      const barY = e.y - size - 6;
+      const pct = Math.max(0, Math.min(1, e.hp / Math.max(1, e.max)));
+      ctx.fillStyle = 'rgba(10, 20, 35, 0.75)';
+      ctx.fillRect(e.x - barW / 2, barY, barW, 2.5);
+      ctx.fillStyle = pct > 0.5 ? '#4ade80' : (pct > 0.25 ? '#facc15' : '#ef4444');
+      ctx.fillRect(e.x - barW / 2, barY, barW * pct, 2.5);
     }
   }
 
@@ -1993,8 +2078,17 @@
     report.diamondsBefore = state.diamonds;
 
     if (!Array.isArray(state.workshop)) {
-      if (state.workshop !== undefined) report.corruptedInputFixed = true;
-      state.workshop = Array(UPS.length).fill(0);
+      const cleanW = Array(UPS.length).fill(0);
+      if (state.workshop && typeof state.workshop === 'object') {
+        for (let i = 0; i < UPS.length; i++) {
+          if (state.workshop[i] !== undefined) {
+            cleanW[i] = safeNonNegInt(state.workshop[i], 0);
+          }
+        }
+      } else if (state.workshop !== undefined) {
+        report.corruptedInputFixed = true;
+      }
+      state.workshop = cleanW;
     } else {
       const cleanW = Array(UPS.length).fill(0);
       for (let i = 0; i < UPS.length; i++) {
@@ -3782,6 +3876,7 @@
     enemyStats,
     critRoll,
     criticalHit,
+    calculateHitCritical,
     projectileDamage,
     contactDamage,
     towerStats,
