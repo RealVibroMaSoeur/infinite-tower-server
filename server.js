@@ -1,440 +1,1854 @@
 'use strict';
-// Infinite Tower CO-OP v0.4.0 — authoritative 2-player combat, no paid services.
-// Rooms and runs are in RAM. Render free instance restarts can erase active runs.
-const http = require('node:http');
-const crypto = require('node:crypto');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const WebSocket = require('ws');
-const PORT = Number(process.env.PORT || 3000);
-const rooms = new Map();
-const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const TYPES = [
-  { name: 'Melee', hp: 1, speed: 1, color: '#7fd3ff' },
-  { name: 'Runner', hp: .65, speed: 1.7, color: '#c3f38d' },
-  { name: 'Tank', hp: 4, speed: .65, color: '#faad74' },
-  { name: 'Ranged', hp: 1.4, speed: .9, color: '#d39bff' },
-  { name: 'Boss', hp: 30, speed: .5, color: '#ff607e' }
-];
-const UPGRADES = [{"name":"Damage","cost":20,"growth":1.16,"cat":"Offense","max":1000},{"name":"Attack Speed","cost":25,"growth":1.18,"cat":"Offense","max":1000},{"name":"Max HP","cost":20,"growth":1.17,"cat":"Defense","max":1000},{"name":"Regeneration","cost":30,"growth":1.19,"cat":"Defense","max":1000},{"name":"Critical Chance","cost":50,"growth":1.23,"cat":"Offense","max":1000},{"name":"Multishot","cost":300,"growth":3.0,"cat":"Offense","max":4},{"name":"Cash / Kill","cost":35,"growth":1.22,"cat":"Economy","max":1000},{"name":"Range","cost":40,"growth":1.2,"cat":"Offense","max":1000},{"name":"Critical Damage","cost":65,"growth":1.2,"cat":"Offense","max":1000},{"name":"Rapid Fire","cost":100,"growth":1.23,"cat":"Offense","max":1000},{"name":"Bounce Shot","cost":400,"growth":1.35,"cat":"Offense","max":5},{"name":"Armor Penetration","cost":650,"growth":1.32,"cat":"Offense","max":5},{"name":"Defense %","cost":55,"growth":1.22,"cat":"Defense","max":1000},{"name":"Absolute Defense","cost":35,"growth":1.18,"cat":"Defense","max":1000},{"name":"Thorns","cost":130,"growth":1.28,"cat":"Defense","max":1},{"name":"Lifesteal","cost":450,"growth":1.32,"cat":"Offense","max":1},{"name":"Energy Shield","cost":900,"growth":1.5,"cat":"Defense","max":1},{"name":"Cash / Wave","cost":70,"growth":1.19,"cat":"Economy","max":1000},{"name":"Coin / Kill","cost":80,"growth":1.22,"cat":"Economy","max":1000},{"name":"Coin / Wave","cost":85,"growth":1.2,"cat":"Economy","max":1000},{"name":"Interest","cost":120,"growth":1.3,"cat":"Economy","max":2},{"name":"XP / Kill","cost":110,"growth":1.25,"cat":"Economy","max":1000},{"name":"Knockback","cost":180,"growth":1.25,"cat":"Defense","max":1000},{"name":"Target Priority","cost":250,"growth":1.35,"cat":"Offense","max":5},{"name":"Burst Chance","cost":300,"growth":1.25,"cat":"Offense","max":1000},{"name":"Burst Count","cost":1200,"growth":1.8,"cat":"Offense","max":4},{"name":"Retired Burst Damage","cost":450,"growth":1.3,"cat":"Retired","max":1000},{"name":"XP / Wave","cost":130,"growth":1.24,"cat":"Economy","max":1000},{"name":"Startup Cash","cost":85,"growth":1.2,"cat":"Economy","max":1000},{"name":"Offense Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Defense Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Utility Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000},{"name":"Economy Free Upgrade","cost":250,"growth":1.3,"cat":"Utility","max":1000}];
+const WebSocketServer = WebSocket.WebSocketServer || WebSocket.Server;
+const Core = require('./InfiniteTowerCore');
+
+const PORT = Number(process.env.PORT || 8080);
+const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/var/data') ? '/var/data' : path.join(__dirname, 'data'));
+const DATA_FILE = process.env.SOCIAL_DATA_FILE || path.join(DATA_DIR, 'social.json');
+const ROOMS_FILE = process.env.ACTIVE_ROOMS_FILE || path.join(DATA_DIR, 'active_rooms.json');
+const REWARDS_FILE = process.env.REWARDS_FILE || path.join(DATA_DIR, 'rewards.json');
 const MAX_MESSAGE_BYTES = 16 * 1024;
-const DISCONNECT_GRACE_MS = 60_000;
-const IDLE_ROOM_MS = 15 * 60_000;
+const HEARTBEAT_MS = 25000;
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS || 45000);
+const ROOM_IDLE_MS = 30 * 60 * 1000;
+const SNAPSHOT_MS = 100;
 const TICK_MS = 50;
-const SNAPSHOT_MS = 200;
-const clamp = (v, a, b) => Math.max(a, Math.min(b, Number.isFinite(+v) ? +v : a));
-const round = (v, p = 1) => Math.round(v * p) / p;
-function newCode() {
-  let v;
-  do { v = Array.from(crypto.randomBytes(6), n => ALPHABET[n % ALPHABET.length]).join(''); }
-  while (rooms.has(v));
-  return v;
-}
-function send(ws, msg) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
-function broadcast(room, msg) { for (const p of room.players) if (p) send(p.ws, msg); }
-function peers(room) { return room.players.map((p, slot) => p ? ({ slot, connected: !!p.ws, ready: !!p.ready, forfeited:!!p.forfeited, name: p.name, maxMap: p.maxMap, maxDiff: p.maxDiff, voteMap: p.voteMap, voteDiff: p.voteDiff, maxSpeed:p.maxSpeed }) : null); }
-function status(room) { broadcast(room, { type: 'room_state', roomCode: room.code, players: peers(room), started: room.started, ended: room.ended }); }
-function error(ws, message) { send(ws, { type: 'error', message }); }
-function sanitizeStats(data) {
-  const v = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
-  const d = (key, fallback, low, high) => v[key] == null || v[key] === '' ? fallback : clamp(v[key], low, high);
-  return {
-    damage: d('damage', 15, 1, 10000),
-    hp: d('hp', 100, 1, 100000),
-    attackSpeed: d('attackSpeed', 1.1, .1, 50),
-    range: d('range', 110, 20, 2000),
-    critChance: d('critChance', .05, 0, .95),
-    critDamage: d('critDamage', 2, 1.2, 20),
-    coinBonus: d('coinBonus', 1, 1, 20),
-    xpBonus: d('xpBonus', 1, 1, 20)
-  };
-}
-function roomCreate() {
-  const room = { code: newCode(), players: [null, null], started: false, ended: false,
-    game: null, lastActive: Date.now(), bothGoneAt: null, lastSnapshot: 0 };
-  rooms.set(room.code, room);
-  return room;
-}
-function attach(ws, room, slot) {
-  const p = room.players[slot];
-  if (p.forfeited) return error(ws, 'You voluntarily quit this run; reconnect disabled');
-  if (p.ws && p.ws !== ws) p.ws.close(4001, 'Reconnected elsewhere');
-  p.ws = ws;
-  ws.room = room; ws.slot = slot;
-  room.bothGoneAt = null;
-  room.lastActive = Date.now();
-  send(ws, { type: 'joined', roomCode: room.code, slot, reconnectToken: p.token });
-  status(room);
-  if (room.game) send(ws, { type: room.ended ? 'game_over' : 'game_state',
-    ...(room.ended ? room.game.result : snapshot(room.game)) });
-}
-function createPlayer(ws, data) {
-  return { ws: null, token: crypto.randomBytes(24).toString('hex'), ready: false,
-    name: String(data.name || 'Player').slice(0, 24),
-    maxMap: Math.round(clamp(data.unlocked?.maxMap ?? 1, 1, 10)),
-    maxDiff: Math.round(clamp(data.unlocked?.maxDiff ?? 0, 0, 4)),
-    initialUpgrades:Array.isArray(data.initialUpgrades)?data.initialUpgrades.slice(0,UPGRADES.length).map((n,i)=>Math.round(clamp(n,0,UPGRADES[i].max))):Array(UPGRADES.length).fill(0),
-    startingCash:clamp(data.startingCash??80,80,1e7),
-    unlockByMap:(data.unlocked?.byMap&&typeof data.unlocked.byMap==='object'&&!Array.isArray(data.unlocked.byMap))?data.unlocked.byMap:null,
-    forfeited:false, allowedUpgrades:Array.isArray(data.unlocked?.allowedUpgrades)?data.unlocked.allowedUpgrades.filter(i=>Number.isInteger(i)&&i>=0&&i<UPGRADES.length):null,
-    voteMap: 1, voteDiff: 0,
-    stats: sanitizeStats(data.stats), maxSpeed: Math.round(clamp(data.maxSpeed ?? 1, 1, 10)) };
-}
-function startGame(room, map, diff) {
-  const players = room.players;
-  const average = {};
-  for (const k of Object.keys(players[0].stats)) average[k] = (players[0].stats[k] + players[1].stats[k]) / 2;
-  const initialHp = average.hp * (1 + ((players[0].initialUpgrades[2]||0)+(players[1].initialUpgrades[2]||0))*.12/2);
-  const game = {
-    map: Math.round(clamp(map ?? 1, 1, 10)), diff: Math.round(clamp(diff ?? 0, 0, 4)),
-    wave: 1, waveTime: 0, elapsed: 0, spawned: 0, kills: 0,
-    hp: initialHp, maxhp: initialHp, shields:0, gold: 0, diamonds: 0, xp: 0,
-    speed: 1, stats: average, nextId: 1, enemies: [], bullets: [],
-    players: players.map((p, slot) => ({ slot, cash: p.startingCash, up: [...p.initialUpgrades], shot: 0, damage: 0, kills: 0, shield:0, freeTick:[0,0,0,0] })),
-    lastTime: Date.now(), result: null
-  };
-  game.shields = Math.floor((game.players[0].up[16]+game.players[1].up[16])/5);
-  room.started = true; room.ended = false; room.game = game;
-  broadcast(room, { type: 'game_started', roomCode: room.code, startedAt: Date.now(), map: game.map, diff: game.diff });
-  broadcast(room, { type: 'game_state', ...snapshot(game) });
-  status(room);
-}
-function towerStats(g, p) {
-  // Indexed according to the SAME UPS table as the solo game.
-  return {
-    dmg:g.stats.damage + p.up[0]*5,
-    speed:g.stats.attackSpeed+p.up[1]*.16+p.up[9]*.07,
-    range:g.stats.range*(1+p.up[7]*.08),
-    crit:Math.min(.95,g.stats.critChance+p.up[4]*.025),
-    critDamage:g.stats.critDamage+p.up[8]*.15,
-    multi:1+Math.min(5,p.up[5]),
-    regen:p.up[3]*.6,
-    defense:Math.min(.75,p.up[12]*.018),
-    absolute:p.up[13]*.35,
-    thorns:p.up[14]*.025,
-    lifesteal:p.up[15]*.007,
-    knockback:p.up[22]*.3,
-    burstChance:Math.min(.75,p.up[24]*.02),
-    burstCount:Math.min(6,2+p.up[25])
-  };
-}
-function spawn(g) {
-  const boss = g.wave % 10 === 0 && g.spawned === 0;
-  const rand = Math.random();
-  const type = boss ? 4 : rand < .1 ? 3 : rand < .28 ? 2 : rand < .52 ? 1 : 0;
-  const angle = Math.random() * Math.PI * 2, dist = 310 + Math.random() * 20;
-  const hp = (17 + Math.pow(g.wave, 1.42) * 1.8) * Math.pow(1.22, g.map - 1) * Math.pow(2.3, g.diff) * TYPES[type].hp;
-  g.enemies.push({ id: g.nextId++, x: Math.cos(angle) * dist, y: Math.sin(angle) * dist,
-    hp, max: hp, type, shot: 0, spd: (15 + g.wave * .08) * TYPES[type].speed,
-    atk: (3 + g.wave * .16) * Math.pow(1.15, g.map - 1) * Math.pow(1.8, g.diff) });
-  g.spawned++;
-}
-function killEnemy(g, enemy, killerSlot) {
-  const idx = g.enemies.indexOf(enemy);
-  if (idx < 0) return;
-  g.enemies.splice(idx, 1);
-  g.kills++;
-  g.players[killerSlot].kills++;
-  const mult = Math.pow(1.42, g.map - 1) * [1, 3, 9, 27, 81][g.diff];
-  const earn = Math.max(1, Math.floor((2 + g.wave * .2) * mult));
-  // Full income for both players, not a split. Personal cash upgrades apply individually.
-  for (const p of g.players) p.cash += earn * (1 + p.up[6] * .12);
-  g.gold += earn * (1 + (g.players[0].up[18]+g.players[1].up[18])*.06/2);
-  g.xp += (2 + g.wave * .15) * Math.pow(1.65, g.map - 1) * Math.pow(3, g.diff) * (enemy.type === 4 ? 30 : 1) * (1+(g.players[0].up[21]+g.players[1].up[21])*.04/2);
-  if (Math.random() < .001 * (enemy.type === 4 ? 20 : 1)) g.diamonds++;
-}
-function tick(g, dt) {
-  dt = Math.min(.15, dt) * g.speed;
-  g.elapsed += dt; g.waveTime += dt;
-  const targetCount = Math.min(8 + Math.floor(g.wave * .7), 65);
-  const spawnInterval = Math.max(.12, .65 - g.wave * .003);
-  if (g.spawned < targetCount && g.waveTime > g.spawned * spawnInterval) spawn(g);
-  for (const p of g.players) {
-    const st = towerStats(g, p), ox = p.slot === 0 ? -25 : 25;
-    g.hp = Math.min(g.maxhp, g.hp + st.regen * dt);
-    p.shot += dt;
-    if (p.shot < 1 / st.speed) continue;
-    p.shot = 0;
-    const targets = g.enemies.filter(e => e.hp > 0 && Math.hypot(e.x - ox, e.y) < st.range)
-      .sort((a, b) => p.up[23]>0 && a.type!==b.type && (a.type===4||b.type===4) ? (b.type===4?1:-1) : Math.hypot(a.x-ox,a.y)-Math.hypot(b.x-ox,b.y));
-    for (const enemy of targets.slice(0, st.multi)) {
-      const damage = st.dmg * (Math.random() < st.crit ? st.critDamage : 1) * (1+p.up[11]*.03);
-      enemy.hp -= damage; p.damage += damage;
-      g.hp=Math.min(g.maxhp,g.hp+damage*st.lifesteal);
-      if(st.knockback && Math.random()<Math.min(.6,p.up[22]*.04)){const d=Math.hypot(enemy.x,enemy.y)||1;enemy.x+=enemy.x/d*st.knockback;enemy.y+=enemy.y/d*st.knockback;}
-      if(Math.random()<st.burstChance){enemy.hp-=damage*Math.max(0,st.burstCount-1)*.35;p.damage+=damage*Math.max(0,st.burstCount-1)*.35;}
-      g.bullets.push({ x: ox, y: 0, tx: enemy.x, ty: enemy.y, slot: p.slot, life: .22 });
-      if (enemy.hp <= 0) killEnemy(g, enemy, p.slot);
-    }
+const MAX_PLAYERS = 4;
+
+const UPS = Core.UPGRADES;
+const TYPES = Core.TYPES;
+const DIFF_MULT = Core.DIFF_MULT;
+const cost = Core.cost;
+
+function ensureDir(file) { fs.mkdirSync(path.dirname(file), { recursive: true }); }
+
+function atomicWriteFileSync(filePath, content) {
+  ensureDir(filePath);
+  const dir = path.dirname(filePath);
+  const tmpFile = path.join(dir, `.${path.basename(filePath)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`);
+  const bakFile = `${filePath}.bak`;
+  const fd = fs.openSync(tmpFile, 'w');
+  try {
+    fs.writeFileSync(fd, content, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
   }
-  for (const enemy of g.enemies) {
-    const dist = Math.hypot(enemy.x, enemy.y) || 1;
-    const stop = enemy.type === 3 ? 60 : 17;
-    if (dist > stop) {
-      enemy.x -= enemy.x / dist * enemy.spd * dt;
-      enemy.y -= enemy.y / dist * enemy.spd * dt;
+
+  try {
+    if (fs.existsSync(filePath)) {
+      try { fs.copyFileSync(filePath, bakFile); } catch (_) {}
+    }
+    fs.renameSync(tmpFile, filePath);
+  } catch (err) {
+    if (process.platform === 'win32') {
+      try { fs.unlinkSync(filePath); } catch (_) {}
+      fs.renameSync(tmpFile, filePath);
     } else {
-      enemy.shot += dt;
-      if (enemy.shot >= (enemy.type === 3 ? 1.6 : 1)) {
-        enemy.shot = 0;
-        const averageDef=(towerStats(g,g.players[0]).defense+towerStats(g,g.players[1]).defense)/2;
-        const averageAbs=(towerStats(g,g.players[0]).absolute+towerStats(g,g.players[1]).absolute)/2;
-        let damage=Math.max(0,enemy.atk*(1-averageDef)-averageAbs);
-        if(g.shields>0 && damage>0){g.shields--;damage=0;}
-        g.hp-=damage;
-        const thorn=(towerStats(g,g.players[0]).thorns+towerStats(g,g.players[1]).thorns)/2;
-        if(thorn>0){enemy.hp-=enemy.max*thorn;if(enemy.hp<=0)killEnemy(g,enemy,0);}
-      }
+      throw err;
     }
   }
-  g.bullets = g.bullets.filter(b => (b.life -= dt) > 0).slice(-40);
-  if (g.hp <= 0) return 'core_destroyed';
-  if (g.spawned >= targetCount && !g.enemies.length) {
-    g.wave++; g.waveTime = 0; g.spawned = 0;
-    for(const p of g.players){
-      p.cash+=5+g.wave*.4+p.up[17]*.09*(5+g.wave*.4)+p.up[20]*Math.min(1000,p.cash)*.01;
-      // Free-upgrade utility: one roll in each category each wave.
-      for(const [idx,cat] of [[29,'Offense'],[30,'Defense'],[31,'Utility'],[32,'Economy']]){
-        if(Math.random()<Math.min(.75,p.up[idx]*.01)){
-          const options=UPGRADES.map((u,i)=>({u,i})).filter(x=>x.u.cat===cat&&x.i!==idx&&x.i!==26&&x.i!==28&&p.up[x.i]<x.u.max);
-          if(options.length){const pick=options[Math.floor(Math.random()*options.length)];p.up[pick.i]++;if(pick.i===2){const gain=g.maxhp*.12;g.maxhp+=gain;g.hp+=gain;}}
+}
+
+function loadJSONSafe(filePath, fallback = {}) {
+  try {
+    ensureDir(filePath);
+    if (fs.existsSync(filePath)) {
+      const data = fs.readFileSync(filePath, 'utf8').trim();
+      if (data) return JSON.parse(data);
+    }
+  } catch (e) {
+    try {
+      const bakFile = `${filePath}.bak`;
+      if (fs.existsSync(bakFile)) {
+        const bakData = fs.readFileSync(bakFile, 'utf8').trim();
+        if (bakData) return JSON.parse(bakData);
+      }
+    } catch (_) {}
+  }
+  return fallback;
+}
+
+// Registre et cache des clés publiques Firebase (Google X.509 et clés de test)
+let cachedGoogleCerts = null;
+let certCacheExpiresAt = 0;
+const testPublicKeys = {};
+
+function registerTestPublicKey(kid, publicKeyPem) {
+  testPublicKeys[kid] = publicKeyPem;
+}
+
+async function fetchGooglePublicCerts() {
+  const now = Date.now();
+  if (cachedGoogleCerts && now < certCacheExpiresAt) {
+    return cachedGoogleCerts;
+  }
+  try {
+    const res = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+    if (!res.ok) throw new Error(`Google certs HTTP ${res.status}`);
+    const data = await res.json();
+    let maxAgeSec = 3600;
+    const cc = res.headers.get('cache-control');
+    if (cc) {
+      const m = cc.match(/max-age=(\d+)/);
+      if (m) maxAgeSec = parseInt(m[1], 10);
+    }
+    cachedGoogleCerts = data;
+    certCacheExpiresAt = now + Math.max(60, maxAgeSec) * 1000;
+    return cachedGoogleCerts;
+  } catch (err) {
+    if (cachedGoogleCerts) return cachedGoogleCerts;
+    return {};
+  }
+}
+
+// Vérification cryptographique rigoureuse des jetons Firebase Authentication (RS256)
+async function verifyFirebaseAuthToken(idToken) {
+  if (!idToken || typeof idToken !== 'string') return null;
+  const trimmed = idToken.trim();
+
+  // Mode test / mock réservé aux environnements hors production
+  if (process.env.NODE_ENV !== 'production' && (trimmed.startsWith('mock-uid-') || trimmed.startsWith('test-token-'))) {
+    const uid = trimmed.replace(/^(mock-uid-|test-token-)/, '');
+    return { uid, email: `${uid}@test.infinitetower.com`, authTime: Date.now() };
+  }
+
+  try {
+    const parts = trimmed.split('.');
+    if (parts.length !== 3) return null;
+
+    let header, payload;
+    try {
+      header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+      payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    } catch (_) {
+      return null;
+    }
+
+    if (!header || header.alg !== 'RS256' || !header.kid) return null;
+
+    const projectId = process.env.FIREBASE_PROJECT_ID || 'infinite-tower-d456f';
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // 1. Validation de l'émetteur
+    if (payload.iss !== `https://securetoken.google.com/${projectId}`) return null;
+    // 2. Validation de l'audience
+    if (payload.aud !== projectId) return null;
+    // 3. Validation de l'identité (sub/uid)
+    if (!payload.sub || typeof payload.sub !== 'string' || payload.sub.trim().length === 0) return null;
+    // 4. Validation de la date d'expiration
+    if (!payload.exp || payload.exp <= nowSec) return null;
+    // 5. Tolérance de skew horaire (5 minutes max)
+    if (payload.iat && payload.iat > nowSec + 300) return null;
+    if (payload.auth_time && payload.auth_time > nowSec + 300) return null;
+
+    // 6. Récupération de la clé publique correspondante (test ou certificat officiel Google)
+    let keyOrCert = testPublicKeys[header.kid];
+    if (!keyOrCert) {
+      const googleCerts = await fetchGooglePublicCerts();
+      keyOrCert = googleCerts[header.kid];
+    }
+    if (!keyOrCert) return null;
+
+    // 7. Vérification de la signature cryptographique RS256
+    const verifier = crypto.createVerify('RSA-SHA256');
+    verifier.update(`${parts[0]}.${parts[1]}`);
+    const signature = Buffer.from(parts[2], 'base64url');
+    const isValid = verifier.verify(keyOrCert, signature);
+    if (!isValid) return null;
+
+    return {
+      uid: String(payload.sub),
+      email: payload.email || null,
+      authTime: payload.auth_time || payload.iat || nowSec
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+function loadDB() {
+  const parsed = loadJSONSafe(DATA_FILE, { accounts: {}, rewards: {} });
+  if (parsed && typeof parsed.accounts === 'object') {
+    if (!parsed.rewards || typeof parsed.rewards !== 'object') parsed.rewards = {};
+    return parsed;
+  }
+  return { accounts: {}, rewards: {} };
+}
+const db = loadDB();
+let saveTimer = null;
+function saveDB(sync = false) {
+  clearTimeout(saveTimer);
+  const write = () => {
+    try { atomicWriteFileSync(DATA_FILE, JSON.stringify(db, null, 2)); } catch (e) {}
+  };
+  if (sync) write();
+  else saveTimer = setTimeout(write, 150);
+}
+
+function loadRewards() {
+  const parsed = loadJSONSafe(REWARDS_FILE, {});
+  return (parsed && typeof parsed === 'object') ? parsed : {};
+}
+const rewardsDb = loadRewards();
+// Synchroniser au démarrage entre db.rewards et rewardsDb pour persistance maximale
+for (const [rid, rec] of Object.entries(db.rewards || {})) {
+  if (!rewardsDb[rid]) rewardsDb[rid] = rec;
+}
+for (const [rid, rec] of Object.entries(rewardsDb)) {
+  if (!db.rewards[rid]) db.rewards[rid] = rec;
+}
+
+let rewardsSaveTimer = null;
+function saveRewards(sync = false) {
+  clearTimeout(rewardsSaveTimer);
+  const write = () => {
+    try { atomicWriteFileSync(REWARDS_FILE, JSON.stringify(rewardsDb, null, 2)); } catch (e) {}
+  };
+  if (sync) write();
+  else rewardsSaveTimer = setTimeout(write, 100);
+}
+
+const socketsByPlayer = new Map();
+const rooms = new Map();
+
+// Intégration Firestore Cloud Externe & Transactions Atomiques
+let firestoreClient = null;
+function setFirestoreInstance(instance) {
+  firestoreClient = instance;
+}
+function getFirestoreInstance() {
+  return firestoreClient;
+}
+
+/**
+ * Transaction atomique Firestore garantissant l'attribution unique des récompenses CO-OP.
+ * Vérifie l'état de la réclamation dans Firestore et met à jour le profil du joueur dans la même transaction.
+ */
+async function executeFirestoreRewardTransaction(firestore, uid, resultId, reward) {
+  if (!firestore || !uid || !resultId || !reward) {
+    throw new Error('Paramètres invalides pour la transaction Firestore');
+  }
+
+  const claimRef = firestore.collection('users').doc(uid).collection('coop_claims').doc(resultId);
+  const saveDocRef = firestore.collection('users').doc(uid).collection('saves').doc('v56');
+
+  return await firestore.runTransaction(async (transaction) => {
+    const claimDoc = await transaction.get(claimRef);
+    if (claimDoc.exists && claimDoc.data()?.claimed) {
+      return {
+        ok: true,
+        alreadyClaimed: true,
+        claimedAt: claimDoc.data().claimedAt,
+        reward: claimDoc.data().reward || reward,
+        message: 'Récompense déjà attribuée dans Firestore (Idempotent)'
+      };
+    }
+
+    const saveDoc = await transaction.get(saveDocRef);
+    let currentCoins = 0;
+    let currentDiamonds = 0;
+    let currentXp = 0;
+    let saveDataObj = null;
+
+    if (saveDoc.exists && saveDoc.data()?.data) {
+      try {
+        saveDataObj = typeof saveDoc.data().data === 'string' ? JSON.parse(saveDoc.data().data) : saveDoc.data().data;
+        currentCoins = Number(saveDataObj.coins || saveDataObj.gold || 0);
+        currentDiamonds = Number(saveDataObj.diamonds || 0);
+        currentXp = Number(saveDataObj.xp || 0);
+      } catch (_) {}
+    }
+
+    const creditedCoins = Number(reward.coins || 0);
+    const creditedDiamonds = Number(reward.diamonds || 0);
+    const creditedXp = Number(reward.xp || 0);
+
+    const newCoins = currentCoins + creditedCoins;
+    const newDiamonds = currentDiamonds + creditedDiamonds;
+    const newXp = currentXp + creditedXp;
+
+    if (saveDataObj) {
+      saveDataObj.coins = newCoins;
+      saveDataObj.gold = newCoins;
+      saveDataObj.diamonds = newDiamonds;
+      saveDataObj.xp = newXp;
+      saveDataObj.updatedAt = Date.now();
+      transaction.set(saveDocRef, {
+        uid: uid,
+        data: JSON.stringify(saveDataObj),
+        updatedAt: Date.now(),
+        format: 'json',
+        version: '2.1.4',
+        saveVersion: 'v56'
+      }, { merge: true });
+    }
+
+    transaction.set(claimRef, {
+      resultId: resultId,
+      uid: uid,
+      claimed: true,
+      claimedAt: Date.now(),
+      reward: {
+        coins: creditedCoins,
+        diamonds: creditedDiamonds,
+        xp: creditedXp,
+        wave: reward.wave || 0,
+        kills: reward.kills || 0
+      }
+    });
+
+    return {
+      ok: true,
+      alreadyClaimed: false,
+      credited: { coins: creditedCoins, diamonds: creditedDiamonds, xp: creditedXp },
+      newBalances: { coins: newCoins, diamonds: newDiamonds, xp: newXp },
+      reward
+    };
+  });
+}
+
+let lastFirestoreRoomsSync = 0;
+async function syncRoomsToFirestore(activeRooms, force = false) {
+  if (!firestoreClient) return;
+  const now = Date.now();
+  // Quota optimization Spark plan : au plus une écriture toutes les 5 secondes sauf force
+  if (!force && (now - lastFirestoreRoomsSync < 5000)) return;
+  lastFirestoreRoomsSync = now;
+  try {
+    const batch = firestoreClient.batch();
+    for (const [code, r] of Object.entries(activeRooms)) {
+      const ref = firestoreClient.collection('coop_active_rooms').doc(code);
+      batch.set(ref, { ...r, syncedAt: now }, { merge: true });
+    }
+    await batch.commit();
+  } catch (_) {}
+}
+
+async function loadRoomsFromFirestore() {
+  if (!firestoreClient) return null;
+  try {
+    const snap = await firestoreClient.collection('coop_active_rooms').get();
+    if (snap.empty) return null;
+    const out = {};
+    snap.forEach(doc => {
+      out[doc.id] = doc.data();
+    });
+    return out;
+  } catch (_) {
+    return null;
+  }
+}
+
+function reconstructRoom(r, now = Date.now()) {
+  if (!r || r.ended || (now - (r.lastActive || 0) > ROOM_IDLE_MS)) return null;
+  const room = {
+    code: r.code,
+    map: r.map,
+    diff: r.diff,
+    speed: r.speed || 1,
+    started: r.started,
+    ended: false,
+    createdAt: r.createdAt || now,
+    lastActive: now,
+    resultIds: r.resultIds || {},
+    players: (r.players || []).map((p, idx) => {
+      if (!p) return null;
+      const pl = {
+        ...p,
+        slot: p.slot !== undefined ? p.slot : idx,
+        ws: null,
+        connected: false,
+        disconnectTimer: null
+      };
+      if (r.started && !pl.forfeited) {
+        const discTime = Number(pl.disconnectedAt) || Number(r.lastActive) || now;
+        const elapsed = now - discTime;
+        const totalGrace = RECONNECT_GRACE_MS + RENDER_DEPLOY_BUFFER_MS;
+        const remainingGrace = totalGrace - elapsed;
+        if (remainingGrace <= 0) {
+          pl.forfeited = true;
+          pl.hp = 0;
+          pl.shields = 0;
+        } else {
+          pl.disconnectTimer = setTimeout(() => {
+            pl.disconnectTimer = null;
+            if (!pl.connected && !room.ended) {
+              pl.forfeited = true;
+              pl.hp = 0;
+              pl.shields = 0;
+              if (room.game) {
+                room.game.hp = room.players.filter(Boolean).reduce((sum, x) => sum + Math.max(0, x.hp), 0);
+                room.game.shields = room.players.filter(Boolean).reduce((sum, x) => sum + (x.shields || 0), 0);
+              }
+              const stillPlaying = room.players.filter(x => x && !x.forfeited && x.connected);
+              if (stillPlaying.length === 0) {
+                finish(room, 'disconnect_timeout');
+                rooms.delete(room.code);
+                saveRooms(true);
+              }
+            }
+          }, remainingGrace);
+          if (pl.disconnectTimer && typeof pl.disconnectTimer.unref === 'function') pl.disconnectTimer.unref();
         }
       }
-    }
-    g.gold+=2*(g.players[0].up[19]+g.players[1].up[19])/2;
-    g.xp+=(20+g.wave*2)*(1+(g.players[0].up[27]+g.players[1].up[27])*.1/2);
-    g.shields=Math.floor((g.players[0].up[16]+g.players[1].up[16])/5);
-    if (g.wave % 10 === 0) g.diamonds++;
-    if (g.wave >= 5000) return 'max_wave';
+      return pl;
+    })
+  };
+
+  if (r.game && room.started) {
+    room.game = {
+      ...r.game,
+      room,
+      players: room.players.filter(Boolean)
+    };
   }
-  return null;
+  rooms.set(r.code, room);
+  return room;
 }
-function snapshot(g) {
+
+async function restoreRoomsFromFirestore() {
+  if (!firestoreClient) return 0;
+  try {
+    const fromFs = await loadRoomsFromFirestore();
+    if (!fromFs || Object.keys(fromFs).length === 0) return 0;
+    const now = Date.now();
+    let count = 0;
+    for (const [code, r] of Object.entries(fromFs)) {
+      if (!rooms.has(code) && r && !r.ended) {
+        if (reconstructRoom(r, now)) count++;
+      }
+    }
+    return count;
+  } catch (err) {
+    return 0;
+  }
+}
+
+const RENDER_DEPLOY_BUFFER_MS = Number(process.env.RENDER_DEPLOY_BUFFER_MS || 60000);
+
+let roomsSaveTimer = null;
+function saveRooms(sync = false) {
+  clearTimeout(roomsSaveTimer);
+  const write = () => {
+    try {
+      const active = {};
+      for (const [code, room] of rooms) {
+        if (!room || room.ended) continue;
+        active[code] = {
+          code: room.code,
+          map: room.map,
+          diff: room.diff,
+          speed: room.speed || (room.game ? room.game.speed : 1),
+          started: room.started,
+          createdAt: room.createdAt,
+          lastActive: room.lastActive,
+          resultIds: room.resultIds || {},
+          players: room.players.map(p => {
+            if (!p) return null;
+            return {
+              slot: p.slot,
+              id: p.id,
+              name: p.name,
+              firebaseUid: p.firebaseUid || null,
+              ready: p.ready,
+              connected: false,
+              disconnectedAt: p.disconnectedAt || Date.now(),
+              forfeited: !!p.forfeited,
+              reconnectToken: p.reconnectToken,
+              maxSpeed: p.maxSpeed,
+              unlocks: p.unlocks,
+              stats: p.stats,
+              initialUpgrades: p.initialUpgrades,
+              permanent: p.permanent,
+              startingCash: p.startingCash,
+              allowedUpgrades: p.allowedUpgrades,
+              targetPriority: p.targetPriority,
+              up: p.up,
+              purchased: p.purchased,
+              cash: p.cash,
+              hp: p.hp,
+              maxhp: p.maxhp,
+              shields: p.shields,
+              kills: p.kills,
+              earnedGold: p.earnedGold,
+              earnedXP: p.earnedXP,
+              posLabel: p.posLabel
+            };
+          }),
+          game: room.game ? {
+            wave: room.game.wave,
+            waveTime: room.game.waveTime,
+            elapsed: room.game.elapsed,
+            spawned: room.game.spawned,
+            kills: room.game.kills,
+            gold: room.game.gold,
+            diamonds: room.game.diamonds,
+            xp: room.game.xp,
+            hp: room.game.hp,
+            maxhp: room.game.maxhp,
+            shields: room.game.shields,
+            speed: room.game.speed,
+            map: room.game.map,
+            diff: room.game.diff,
+            enemies: (room.game.enemies || []).map(e => ({ ...e })),
+            nextId: room.game.nextId
+          } : null
+        };
+      }
+      atomicWriteFileSync(ROOMS_FILE, JSON.stringify(active, null, 2));
+      if (firestoreClient) {
+        syncRoomsToFirestore(active, sync).catch(() => {});
+      }
+    } catch (e) {}
+  };
+  if (sync) write();
+  else roomsSaveTimer = setTimeout(write, 100);
+}
+
+function loadRooms() {
+  try {
+    const parsed = loadJSONSafe(ROOMS_FILE, {});
+    if (parsed && typeof parsed === 'object') {
+      const now = Date.now();
+      for (const [code, r] of Object.entries(parsed)) {
+        reconstructRoom(r, now);
+      }
+    }
+  } catch (e) {}
+}
+
+loadRooms();
+
+function id(prefix = 'IT') { return prefix + '-' + crypto.randomBytes(4).toString('hex').toUpperCase(); }
+function token() { return crypto.randomBytes(24).toString('hex'); }
+function roomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let tries = 0; tries < 100; tries++) {
+    let code = '';
+    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    if (!rooms.has(code)) return code;
+  }
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+function cleanName(v) {
+  const s = String(v || 'Player').replace(/[^\w \-'.]/g, '').trim().slice(0, 20);
+  return s || 'Player';
+}
+function clampInt(v, min, max, d = min) {
+  const n = Number(v);
+  return Number.isInteger(n) ? Math.max(min, Math.min(max, n)) : d;
+}
+function clampNum(v, min, max, d = min) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : d;
+}
+function safeStats(raw = {}) {
+  const b = raw.boosterBonuses && typeof raw.boosterBonuses === 'object' ? raw.boosterBonuses : {};
+  const bf = (k, max = 0.5) => clampNum(b[k], 0, max, 0);
   return {
-    map: g.map, diff: g.diff, wave: g.wave, elapsed: round(g.elapsed, 10),
-    hp: round(g.hp, 10), maxhp: round(g.maxhp, 10), kills: g.kills,
-    gold: round(g.gold, 10), diamonds: g.diamonds, xp: round(g.xp, 10), speed: g.speed,
-    players: g.players.map(p => ({ slot: p.slot, cash: round(p.cash, 10), up: p.up,
-      damage: round(p.damage, 10), kills: p.kills,
-      range: round(towerStats(g, p).range, 10), dmg: round(towerStats(g, p).dmg, 10) })),
-    enemies: g.enemies.slice(0, 70).map(e => ({ id: e.id, x: round(e.x, 10), y: round(e.y, 10),
-      hp: round(e.hp, 10), max: round(e.max, 10), type: e.type })),
-    bullets: g.bullets.slice(-25).map(b => ({ x: b.x, y: b.y, tx: round(b.tx, 10), ty: round(b.ty, 10), slot: b.slot }))
+    damage: clampNum(raw.damage, 1, 1e9, 15) * (1 + bf('dmg')),
+    hp: clampNum(raw.hp, 20, 1e9, 100) * (1 + bf('hp')),
+    attackSpeed: clampNum(raw.attackSpeed, 0.2, 50, 1.1) * (1 + bf('speed')),
+    critChance: Math.min(1, clampNum(raw.critChance, 0, 1, 0) + bf('crit', 0.25)),
+    critDamage: clampNum(raw.critDamage, 1, 100, 2) + bf('critDamage', 1),
+    range: clampNum(raw.range, 60, 10000, 110) * (1 + bf('range')),
+    coinBonus: clampNum(raw.coinBonus, 1, 1e6, 1) * (1 + bf('coin')),
+    xpBonus: clampNum(raw.xpBonus, 1, 1e6, 1) * (1 + bf('xp')),
+    extraMulti: clampInt(raw.extraMulti, 0, 10, 0),
+    boosterRegen: bf('regen'),
+    boosterDefense: bf('defense'),
+    boosterDamageReduction: bf('damageReduction', 0.4),
+    boosterInterest: bf('interest'),
+    boosterProjectileSpeed: bf('projectileSpeed'),
+    boosterShield: bf('shield'),
+    boosterSlow: bf('slow', 0.4),
+    boosterCash: bf('cash'),
+    projectileSpeed: clampNum(raw.projectileSpeed, 200, 2500, 450),
+    burstChanceBonus: clampNum(raw.burstChanceBonus, 0, 1, 0),
+    multishotChance: clampNum(raw.multishotChance, 0, 1, 0),
+    bounceChance: clampNum(raw.bounceChance, 0, 1, 0),
+    rapidFireChance: clampNum(raw.rapidFireChance, 0, 1, 0),
+    rapidFireMultiplier: clampNum(raw.rapidFireMultiplier, 1, 5, 1),
+    bounceCount: clampInt(raw.bounceCount, 0, 6, 0),
+    waveEndHeal: clampNum(raw.waveEndHeal, 0, 0.5, 0)
   };
 }
-function finish(room, reason) {
-  if (!room.game || room.ended) return;
+function safeUnlocks(raw = {}) {
+  const maxMap = clampInt(raw.maxMap, 1, 10, 1);
+  const maxDiff = clampInt(raw.maxDiff, 0, DIFF_MULT.length - 1, 0);
+  const byMap = {};
+  if (raw.byMap && typeof raw.byMap === 'object') {
+    for (let m = 1; m <= 10; m++) {
+      const list = Array.isArray(raw.byMap[m]) ? raw.byMap[m] : [];
+      const clean = [...new Set(list.map(x => clampInt(x, 0, DIFF_MULT.length - 1, -1)).filter(x => x >= 0))];
+      if (clean.length) byMap[m] = clean;
+    }
+  }
+  if (!Object.keys(byMap).length) {
+    for (let m = 1; m <= maxMap; m++) {
+      byMap[m] = [];
+      for (let d = 0; d <= (m === maxMap ? maxDiff : DIFF_MULT.length - 1); d++) byMap[m].push(d);
+    }
+  }
+  return { maxMap, maxDiff, byMap };
+}
+function safeInitialUpgrades(raw) {
+  const arr = Array.isArray(raw) ? raw : [];
+  return UPS.map((u, i) => clampInt(arr[i], 0, u.max, 0));
+}
+function safeProfile(raw = {}, fallbackInitialUpgrades = []) {
+  const p = raw && typeof raw === 'object' ? raw : {};
+  const wl = Array.isArray(p.workshopLevels) ? p.workshopLevels : fallbackInitialUpgrades;
+  const ll = Array.isArray(p.workshopLabLevels) ? p.workshopLabLevels : [];
+  const workshopLevels = UPS.map((u, i) => clampInt(wl[i], 0, Core.workshopCap(i), 0));
+  const workshopLabLevels = UPS.map((u, i) => clampInt(ll[i], 0, Core.labCap(i), 0));
+  const bon = p.bonuses && typeof p.bonuses === 'object' ? p.bonuses : {};
+  const mod = p.modifiers && typeof p.modifiers === 'object' ? p.modifiers : {};
+  const bst = p.boosters && typeof p.boosters === 'object'
+    ? p.boosters
+    : (p.boosterProfile ? Core.computeBoosterBonuses(p.boosterProfile) : {});
+  const eff = p.effects && typeof p.effects === 'object' ? p.effects : {};
+  const labs = p.labs && typeof p.labs === 'object' ? p.labs : {};
+  return {
+    workshopLevels,
+    workshopLabLevels,
+    bonuses: {
+      hp: clampNum(bon.hp, 0, 1e6, 0),
+      dmg: clampNum(bon.dmg, 0, 1e6, 0),
+      speed: clampNum(bon.speed, 0, 1e6, 0),
+      coin: clampNum(bon.coin, 0, 1e6, 0),
+      xp: clampNum(bon.xp, 0, 1e6, 0),
+      range: clampNum(bon.range, 0, 1e6, 0),
+      crit: clampNum(bon.crit, 0, 100, 0),
+      critDamage: clampNum(bon.critDamage, 0, 1e6, 0),
+      multi: clampInt(bon.multi, 0, 20, 0),
+      extra: clampInt(bon.extra, 0, 20, 0)
+    },
+    modifiers: {
+      regen: clampNum(mod.regen, 0, 100, 0),
+      defense: clampNum(mod.defense, 0, 100, 0),
+      damageReduction: clampNum(mod.damageReduction, 0, 0.8, 0),
+      bossResist: clampNum(mod.bossResist, 0, 0.8, 0),
+      missingHpDamage: clampNum(mod.missingHpDamage, 0, 100, 0),
+      enemyDamage: clampNum(mod.enemyDamage, 0, 100, 0),
+      bossDamage: clampNum(mod.bossDamage, 0, 100, 0),
+      eliteDamage: clampNum(mod.eliteDamage, 0, 100, 0),
+      enemyFragility: clampNum(mod.enemyFragility, 0, 100, 0),
+      cash: clampNum(mod.cash, 0, 100, 0),
+      gold: clampNum(mod.gold, 0, 100, 0),
+      diamonds: clampNum(mod.diamonds, 0, 100, 0)
+    },
+    boosters: {
+      dmg: clampNum(bst.dmg, 0, 0.5, 0),
+      speed: clampNum(bst.speed, 0, 0.5, 0),
+      range: clampNum(bst.range, 0, 0.5, 0),
+      hp: clampNum(bst.hp, 0, 0.5, 0),
+      regen: clampNum(bst.regen, 0, 0.5, 0),
+      defense: clampNum(bst.defense, 0, 0.5, 0),
+      cash: clampNum(bst.cash, 0, 0.5, 0),
+      coin: clampNum(bst.coin, 0, 0.5, 0),
+      crit: clampNum(bst.crit, 0, 0.05, 0),
+      critDamage: clampNum(bst.critDamage, 0, 0.5, 0),
+      damageReduction: clampNum(bst.damageReduction, 0, 0.4, 0),
+      interest: clampNum(bst.interest, 0, 0.5, 0),
+      projectileSpeed: clampNum(bst.projectileSpeed, 0, 0.5, 0),
+      shield: clampNum(bst.shield, 0, 0.5, 0),
+      xp: clampNum(bst.xp, 0, 0.5, 0),
+      slow: clampNum(bst.slow, 0, 0.4, 0)
+    },
+    effects: {
+      projectileSpeed: clampNum(eff.projectileSpeed, 200, 2500, Math.min(2500, Math.max(450, 450 + 8 * ((workshopLevels[1] || 0) + (workshopLabLevels[1] || 0))))),
+      burstChance: clampNum(eff.burstChance, 0, 1, Math.min(1, ((workshopLevels[24] || 0) + (workshopLabLevels[24] || 0) + (workshopLevels[34] || 0)) * 0.025)),
+      multishotChance: clampNum(eff.multishotChance, 0, 1, Math.min(1, ((workshopLevels[35] || 0) + (workshopLabLevels[35] || 0)) * 0.025)),
+      bounceChance: clampNum(eff.bounceChance, 0, 1, Math.min(1, ((workshopLevels[36] || 0) + (workshopLabLevels[36] || 0)) * 0.025)),
+      rapidFireChance: clampNum(eff.rapidFireChance, 0, 1, workshopLevels[37] * 0.01),
+      rapidFireMultiplier: clampNum(eff.rapidFireMultiplier, 1, 5, 1),
+      bounceCount: clampInt(eff.bounceCount, 0, 6, 0),
+      lifeOnWaveEnd: clampNum(eff.lifeOnWaveEnd, 0, 0.5, workshopLevels[38] * 0.005),
+      startupCash: clampInt(eff.startupCash, 0, 1e9, workshopLevels[39] * 10 + workshopLevels[28] * 10)
+    },
+    labs: {
+      freeUpgrade: Array.isArray(labs.freeUpgrade) ? labs.freeUpgrade.slice(0, 4).map(x => clampInt(x, 0, 200, 0)) : [0, 0, 0, 0],
+      xpPerWave: clampInt(labs.xpPerWave, 0, 200, 0),
+      startupCash: clampInt(labs.startupCash, 0, 200, 0)
+    },
+    overcrit: !!p.overcrit
+  };
+}
+function safeAllowedUpgrades(raw) {
+  if (!Array.isArray(raw)) return UPS.map((_, i) => i).filter(i => i !== 26 && i !== 28);
+  return [...new Set(raw.map(x => clampInt(x, 0, UPS.length - 1, -1)).filter(i => i >= 0 && i !== 26 && i !== 28))];
+}
+function roomUnlockedForAll(room, map, diff) {
+  const players = room.players.filter(Boolean);
+  if (!players.length) return map === 1 && diff === 0;
+  return players.every(p => Array.isArray(p.unlocks?.byMap?.[map]) && p.unlocks.byMap[map].includes(diff));
+}
+function clampRoomStageToPlayers(room) {
+  if (roomUnlockedForAll(room, room.map, room.diff)) return;
+  for (let m = Math.min(room.map, 10); m >= 1; m--) {
+    for (let d = DIFF_MULT.length - 1; d >= 0; d--) {
+      if (roomUnlockedForAll(room, m, d)) { room.map = m; room.diff = d; return; }
+    }
+  }
+  room.map = 1;
+  room.diff = 0;
+}
+function send(ws, obj) {
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify(obj)); } catch (e) {}
+  }
+}
+function broadcast(room, obj) {
+  for (const p of room.players) if (p && p.ws) send(p.ws, obj);
+}
+
+function publicProfile(acc) {
+  return { id: acc.id, name: acc.name };
+}
+function friendStatus(id) {
+  const acc = db.accounts[id];
+  if (!acc) return null;
+  const ws = socketsByPlayer.get(id);
+  return { id: acc.id, name: acc.name, status: ws ? (ws.roomCode ? 'In CO-OP' : 'Online') : 'Offline' };
+}
+function sendFriends(acc, ws) {
+  const friends = (acc.friends || []).map(friendStatus).filter(Boolean);
+  const requests = (acc.requests || []).map(rid => db.accounts[rid]).filter(Boolean).map(publicProfile);
+  send(ws, { type: 'friends', friends, requests });
+}
+function notifyFriends(acc) {
+  const status = friendStatus(acc.id);
+  for (const fid of acc.friends || []) {
+    const fws = socketsByPlayer.get(fid);
+    if (fws) send(fws, { type: 'friend_status', friend: status });
+  }
+}
+
+function permanentLevel(p, index) {
+  const u = UPS[index];
+  if (!u) return 0;
+  if (p?.permanent?.workshopLevels) {
+    return clampInt((p.permanent.workshopLevels[index] || 0) + (p.permanent.workshopLabLevels?.[index] || 0), 0, u.max, 0);
+  }
+  return clampInt(p?.initialUpgrades?.[index], 0, u.max, 0);
+}
+function totalLevel(p, index) {
+  const u = UPS[index];
+  if (!u) return 0;
+  return clampInt(permanentLevel(p, index) + clampInt(p?.up?.[index], 0, u.max, 0), 0, u.max, 0);
+}
+function effectiveLevels(p) {
+  return UPS.map((_, i) => totalLevel(p, i));
+}
+
+function makeRoom(hostWs, msg) {
+  const code = roomCode();
+  const rToken = token();
+  const hostUnlocks = safeUnlocks(msg.unlocks);
+  const reqMap = clampInt(msg.map, 1, 10, 1);
+  const reqDiff = clampInt(msg.diff, 0, DIFF_MULT.length - 1, 0);
+  const initUp = safeInitialUpgrades(msg.initialUpgrades);
+  const perm = safeProfile(msg.profile || msg.permanentProfile, initUp);
+  const room = {
+    code,
+    createdAt: Date.now(),
+    lastActive: Date.now(),
+    map: Array.isArray(hostUnlocks.byMap[reqMap]) && hostUnlocks.byMap[reqMap].includes(reqDiff) ? reqMap : 1,
+    diff: Array.isArray(hostUnlocks.byMap[reqMap]) && hostUnlocks.byMap[reqMap].includes(reqDiff) ? reqDiff : 0,
+    started: false,
+    ended: false,
+    players: [
+      {
+        slot: 0,
+        id: hostWs.playerId || id('P'),
+        firebaseUid: String(msg.firebaseUid || hostWs.firebaseUid || '').trim() || null,
+        name: cleanName(msg.name || hostWs.playerName),
+        ready: false,
+        connected: true,
+        forfeited: false,
+        reconnectToken: rToken,
+        maxSpeed: clampInt(msg.maxSpeed, 1, 10, 1),
+        unlocks: hostUnlocks,
+        stats: safeStats(msg.stats),
+        initialUpgrades: initUp,
+        permanent: perm,
+        startingCash: clampInt(msg.startingCash, 0, 1e9, perm.effects.startupCash || 80),
+        allowedUpgrades: safeAllowedUpgrades(msg.allowedUpgrades),
+        up: Array(UPS.length).fill(0),
+        purchased: Array(UPS.length).fill(0),
+        cash: clampInt(msg.startingCash, 0, 1e9, perm.effects.startupCash || 80),
+        ws: hostWs,
+        disconnectTimer: null
+      },
+      null,
+      null,
+      null
+    ],
+    game: null
+  };
+  hostWs.roomCode = code;
+  hostWs.room = room;
+  hostWs.slot = 0;
+  rooms.set(code, room);
+  saveRooms();
+  return { room, reconnectToken: rToken };
+}
+
+function lobbyState(room) {
+  // Note: Speed in CO-OP is NEVER capped to Math.min of players (Section 5).
+  // maxSpeed here is informational; each player can activate up to their own maxSpeed.
+  const activePlayers = room.players.filter(Boolean);
+  return {
+    code: room.code,
+    map: room.map,
+    diff: room.diff,
+    started: room.started,
+    maxSpeed: activePlayers.reduce((m, p) => Math.max(m, p.maxSpeed || 1), 1),
+    players: room.players.map((p, idx) => p ? {
+      slot: idx,
+      id: p.id,
+      name: p.name,
+      ready: !!p.ready,
+      connected: !!p.connected,
+      forfeited: !!p.forfeited,
+      maxSpeed: p.maxSpeed,
+      unlocks: p.unlocks,
+      pos: Core.TOWER_POSITIONS[idx]
+    } : null)
+  };
+}
+
+function startGame(room, mapOverride, diffOverride, requireReady = false) {
+  if (!room) return false;
+  if (mapOverride !== undefined) room.map = clampInt(mapOverride, 1, 10, room.map || 1);
+  if (diffOverride !== undefined) room.diff = clampInt(diffOverride, 0, DIFF_MULT.length - 1, room.diff || 0);
+  if (!room.map) room.map = 1;
+  if (room.diff === undefined) room.diff = 0;
+
+  room.players.forEach((p, idx) => {
+    if (!p) return;
+    if (p.slot === undefined) p.slot = idx;
+    if (p.connected === undefined) p.connected = true;
+    if (!requireReady && p.ready === undefined) p.ready = true;
+    if (!p.stats) p.stats = safeStats({});
+    if (!p.permanent) p.permanent = safeProfile({}, p.initialUpgrades);
+  });
+
+  const players = room.players.filter(Boolean);
+  if (room.started || players.length < 2) return false;
+  if (requireReady && !players.every(p => p.ready && p.connected)) return false;
+
+  room.started = true;
+  for (const p of players) {
+    const pos = Core.TOWER_POSITIONS[p.slot] || { x: 0, y: 0, label: 'Nord' };
+    p.x = pos.x;
+    p.y = pos.y;
+    p.posLabel = (pos.label || 'NORD').toUpperCase();
+    p.up = Array(UPS.length).fill(0);
+    p.purchased = Array(UPS.length).fill(0);
+    p.cash = p.startingCash !== undefined ? p.startingCash : 80;
+    p.hp = p.stats.hp;
+    p.maxhp = p.stats.hp;
+    p.shields = Math.round(Core.shieldCapacity(permanentLevel(p, 16)) * (1 + (p.stats.boosterShield || 0)));
+    p.shot = 0;
+    p.rapidFireRemaining = 0;
+    p.rapidFireTriggers = 0;
+    p.interestTimer = 0;
+    p.burstQueue = [];
+    p.kills = 0;
+    p.damage = 0;
+    p.taken = 0;
+    p.earnedGold = 0;
+    p.earnedXP = 0;
+    p.forfeited = false;
+  }
+
+  const totalHp = players.reduce((sum, p) => sum + p.maxhp, 0);
+  const totalShields = players.reduce((sum, p) => sum + (p.shields || 0), 0);
+  room.game = {
+    room,
+    wave: 1,
+    waveTime: 0,
+    elapsed: 0,
+    spawned: 0,
+    kills: 0,
+    gold: 0,
+    diamonds: 0,
+    xp: 0,
+    hp: totalHp,
+    maxhp: totalHp,
+    shields: totalShields,
+    speed: room.speed || 1,
+    map: room.map,
+    diff: room.diff,
+    players,
+    enemies: [],
+    bullets: [],
+    enemyBullets: [],
+    nextId: 1
+  };
+  room.speed = room.game.speed;
+  broadcast(room, { type: 'game_started', state: snapshot(room) });
+  saveRooms();
+  return true;
+}
+
+function towerStats(g, p) {
+  const effUp = effectiveLevels(p);
+  const eff = Core.computeUpgradeEffects(p.permanent?.workshopLevels || p.initialUpgrades, p.up, {});
+  const rapidMult = Math.max(1, Number(p.permanent?.effects?.rapidFireMultiplier ?? p.stats?.rapidFireMultiplier) || eff.rapidFireMultiplier || 1);
+  const st = Core.towerStats(effUp, { ...(p.stats || {}), maxHp: p.maxhp }, {
+    regen: (Number(p.permanent?.modifiers?.regen) || 0) + (p.stats?.boosterRegen || 0) * 10,
+    defense: (Number(p.permanent?.modifiers?.defense) || 0) + (p.stats?.boosterDefense || 0)
+  });
+  st.defense = Math.min(0.95, Math.max(0, st.defense));
+  st.speed *= ((Number(p.rapidFireRemaining) || 0) > 0 ? rapidMult : 1);
+  return st;
+}
+
+function spawnEnemy(g) {
+  return Core.spawnWaveBatch(g);
+}
+
+function tick(g, dt) {
+  if (!g || g.over) return;
+  // Step 3B: High-precision sub-stepping at x1, x5, and x10 to guarantee bullet collision precision & zero tunneling
+  const totalDt = Math.min(0.5, dt * (g.speed || 1));
+  const stepSlice = 0.05;
+  let remaining = totalDt;
+  const effCache = new WeakMap();
+  const getEffUp = p => {
+    let v = effCache.get(p);
+    if (!v) {
+      v = effectiveLevels(p);
+      effCache.set(p, v);
+    }
+    return v;
+  };
+  while (remaining > 0 && !g.over) {
+    const slice = Math.min(stepSlice, remaining);
+    remaining -= slice;
+    const result = Core.stepCombat(g, slice, {
+      getEffectiveUp: getEffUp,
+      getTowerStats: (p) => towerStats(g, p)
+    });
+    if (result === 'core_destroyed' || result === 'max_wave') {
+      g.over = true;
+      g.reason = result;
+      break;
+    }
+  }
+}
+
+function upgrade(room, slot, index, batch = 1) {
   const g = room.game;
+  const p = room.players[slot];
+  if (!g || !p || p.forfeited || !Number.isInteger(index) || index < 0 || index >= UPS.length) return false;
+  if (Array.isArray(p.allowedUpgrades) && !p.allowedUpgrades.includes(index)) return false;
+
+  const limit = batch === 'max' ? 1000 : clampInt(batch, 1, 1000, 1);
+  let count = 0;
+
+  while (count < limit) {
+    const effUp = effectiveLevels(p);
+    const eff = Core.computeUpgradeEffects(p.permanent?.workshopLevels || p.initialUpgrades, p.up, {});
+    const st = towerStats(g, p);
+    const permanentHeal = Math.min(0.5, (p.stats.waveEndHeal || 0) + (eff.lifeOnWaveEnd || 0));
+    const currentHeal = Core.waveEndHealFraction(permanentHeal, (p.up[40] || 0) * 0.005);
+    const freeLabBonus = Number(p.permanent?.labs?.freeUpgrade?.[index - 29]) || 0;
+
+    if (!Core.canBuyRunUpgrade(index, {
+      up: p.up,
+      effectiveUp: effUp,
+      stats: st,
+      effects: eff,
+      waveEndHeal: currentHeal,
+      freeUpgradeLabLevel: freeLabBonus
+    })) break;
+
+    const rawC = cost(index, p.up[index]);
+    const c = Core.discountedLevelPrice(rawC, batch);
+    if (p.cash < c || !Number.isFinite(c) || c >= Number.MAX_SAFE_INTEGER) break;
+
+    p.cash -= c;
+    p.up[index]++;
+    if (Array.isArray(p.purchased)) p.purchased[index] = (p.purchased[index] || 0) + 1;
+    count++;
+
+    if (index === 2) {
+      const nextLv = totalLevel(p, 2);
+      const hp = Core.hpUpgrade(p.maxhp, p.hp, nextLv - 1, nextLv);
+      p.maxhp = hp.max;
+      p.hp = hp.hp;
+      g.maxhp = room.players.filter(Boolean).reduce((sum, pl) => sum + pl.maxhp, 0);
+      g.hp = room.players.filter(Boolean).reduce((sum, pl) => sum + Math.max(0, pl.hp), 0);
+    }
+    if (index === 16) {
+      p.shields = Math.round(Core.shieldCapacity(totalLevel(p, 16)) * (1 + (p.stats.boosterShield || 0)));
+      g.shields = room.players.filter(Boolean).reduce((sum, pl) => sum + (pl.shields || 0), 0);
+    }
+  }
+  if (count > 0) saveRooms();
+  return count > 0;
+}
+
+function snapshot(roomOrGame) {
+  const room = roomOrGame && roomOrGame.room ? roomOrGame.room : roomOrGame;
+  const g = room && room.game ? room.game : (roomOrGame && Array.isArray(roomOrGame.players) && roomOrGame.wave ? roomOrGame : null);
+  if (!g) return lobbyState(room);
+  const rPlayers = room && Array.isArray(room.players) ? room.players : g.players;
+  return {
+    code: room ? room.code : undefined,
+    started: true,
+    wave: g.wave,
+    map: room ? room.map : g.map,
+    diff: room ? room.diff : g.diff,
+    speed: g.speed,
+    maxSpeed: rPlayers.filter(Boolean).reduce((m, p) => Math.max(m, p.maxSpeed || 1), 1),
+    hp: Math.round(g.hp),
+    maxhp: Math.round(g.maxhp),
+    shields: Math.round(g.shields || 0),
+    kills: g.kills,
+    gold: Math.floor(g.gold),
+    diamonds: g.diamonds,
+    xp: Math.floor(g.xp),
+    elapsed: Math.floor(g.elapsed),
+    players: rPlayers.map((p, idx) => p ? {
+      slot: p.slot ?? idx,
+      id: p.id,
+      name: p.name,
+      connected: !!p.connected,
+      forfeited: !!p.forfeited,
+      cash: Math.floor(p.cash),
+      hp: Math.round(p.hp),
+      maxhp: Math.round(p.maxhp),
+      shields: Math.round(p.shields || 0),
+      kills: p.kills || 0,
+      damage: Math.floor(p.damage || 0),
+      up: p.up,
+      permanentLevels: UPS.map((_, i) => permanentLevel(p, i)),
+      effectiveUp: effectiveLevels(p),
+      maxSpeed: p.maxSpeed,
+      pos: Core.TOWER_POSITIONS[p.slot ?? idx]
+    } : null),
+    enemies: (g.enemies || []).slice(0, 80).map(e => [e.id, Math.round(e.x), Math.round(e.y), Math.round(e.hp), Math.round(e.max), e.type, e.isGiant ? (e.giantFactor || 6) : 0]),
+    bullets: (g.bullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y), Math.round(b.txX ?? b.tx?.x ?? 0), Math.round(b.txY ?? b.tx?.y ?? 0), b.slot, b.crit ? 1 : 0]),
+    enemyBullets: (g.enemyBullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y)])
+  };
+}
+
+function finish(room, reason) {
+  if (!room || room.ended) return;
   room.ended = true;
-  const coinReward = Math.floor((g.gold + g.wave * 3) * Math.pow(1.4, g.map - 1) * [1, 3, 9, 27, 81][g.diff] * g.stats.coinBonus);
-  const result = { roomCode: room.code, reason, map: g.map, diff: g.diff, wave: g.wave,
-    coins: coinReward, diamonds: g.diamonds, xp: Math.floor(g.xp * g.stats.xpBonus),
-    kills: g.kills, resultId: crypto.randomBytes(12).toString('hex') };
-  g.result = result;
-  broadcast(room, { type: 'game_over', ...result });
-  status(room);
+  const g = room.game;
+  if (!room.resultIds) room.resultIds = {};
+  if (!db.rewards) db.rewards = {};
+  room.players.forEach((p, idx) => {
+    if (!p || p.forfeited) return;
+    const slot = p.slot ?? idx;
+    if (!room.resultIds[slot]) room.resultIds[slot] = crypto.randomBytes(16).toString('hex');
+    const resId = room.resultIds[slot];
+    const rawWave = g ? g.wave : 1;
+    const creditedWave = (rawWave >= 5000 && (!g || !g.wave5000Cleared) && reason !== 'max_wave' && reason !== 'Wave Complete')
+      ? 4999
+      : Math.min(5000, rawWave);
+    const rewards = Core.calculateRunRewards({
+      earnedGold: p.earnedGold !== undefined ? p.earnedGold : (g ? g.gold : 0),
+      earnedXP: p.earnedXP !== undefined ? p.earnedXP : (g ? g.xp : 0),
+      wave: creditedWave,
+      map: room.map || 1,
+      diff: room.diff || 0,
+      coinBonus: p.stats?.coinBonus || 1,
+      xpBonus: p.stats?.xpBonus || 1,
+      diamonds: g ? g.diamonds : 0
+    });
+    // Registre persistant anti-duplication des récompenses côté serveur
+    const rewardRecord = {
+      resultId: resId,
+      slot,
+      playerId: p.id,
+      firebaseUid: p.firebaseUid || null,
+      roomCode: room.code,
+      wave: creditedWave,
+      coins: rewards.coins,
+      diamonds: rewards.diamonds,
+      xp: rewards.xp,
+      finishedAt: Date.now(),
+      reason,
+      claimed: false,
+      claimedAt: null,
+      claimedByUid: null,
+      firestoreSynced: false
+    };
+    db.rewards[resId] = rewardRecord;
+    rewardsDb[resId] = rewardRecord;
+    send(p.ws, {
+      type: 'game_over',
+      reason,
+      slot,
+      resultId: resId,
+      firebaseUid: p.firebaseUid || null,
+      wave: creditedWave,
+      kills: g ? g.kills : 0,
+      playerKills: p.kills || 0,
+      coins: rewards.coins,
+      diamonds: rewards.diamonds,
+      xp: rewards.xp,
+      elapsed: g ? Math.floor(g.elapsed || 0) : 0,
+      map: room.map || 1,
+      diff: room.diff || 0
+    });
+  });
+  saveRewards(true);
+  saveDB(true);
+  saveRooms(true);
 }
-function upgrade(room, slot, index, batch=1) {
-  const g=room.game,p=g.players[slot],def=UPGRADES[index],owner=room.players[slot];
-  if(!def || def.cat==='Retired'||index===28 || (owner.allowedUpgrades && !owner.allowedUpgrades.includes(index)))return false;
-  if(![1,10,100,'max'].includes(batch))batch=1;
-  const times=batch==='max'?1000:batch;
-  let bought=0;
-  for(let n=0;n<times;n++){
-    if(p.up[index]>=def.max)break;
-    const cost=Math.ceil(def.cost*Math.pow(def.growth,p.up[index]));
-    if(!Number.isFinite(cost)||p.cash<cost)break;
-    p.cash-=cost;p.up[index]++;bought++;
-    if(index===2){const gain=g.maxhp*.12;g.maxhp+=gain;g.hp+=gain;}
-    if(index===16 && p.up[index]%5===0)g.shields++;
-  }
-  return bought>0;
+
+function getRoomMaxSpeed(room) {
+  if (!room || !Array.isArray(room.players)) return 1;
+  const activePlayers = room.players.filter(p => p && !p.forfeited && p.connected !== false);
+  if (!activePlayers.length) return 1;
+  const limits = activePlayers.map(p => Math.max(1, Math.min(10, Math.floor(Number(p.maxSpeed) || 1))));
+  return Math.min(...limits);
 }
-function onMessage(ws, msg) {
-  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return error(ws, 'Invalid message');
-  const type = msg.type;
-  if (type === 'ping') return send(ws, { type: 'pong', time: Date.now() });
-  if (type === 'create_room') {
-    if (ws.room) return error(ws, 'Already in a room');
-    const room = roomCreate();
-    room.players[0] = createPlayer(ws, msg);
-    return attach(ws, room, 0);
+
+function syncRoomSpeedCap(room) {
+  if (!room) return;
+  const commonMax = getRoomMaxSpeed(room);
+  const curSpd = room.game ? (room.game.speed || room.speed || 1) : (room.speed || 1);
+  if (curSpd > commonMax) {
+    if (room.game) room.game.speed = commonMax;
+    room.speed = commonMax;
+    broadcast(room, { type: 'speed_changed', speed: commonMax, maxSpeed: commonMax, clamped: true });
   }
-  if (type === 'join_room') {
-    if (ws.room) return error(ws, 'Already in a room');
-    const room = rooms.get(String(msg.roomCode || '').trim().toUpperCase());
-    if (!room) return error(ws, 'Room not found');
-    if (room.started) return error(ws, 'Room already started');
-    if (room.players[1]) return error(ws, 'Room full');
-    room.players[1] = createPlayer(ws, msg);
-    return attach(ws, room, 1);
-  }
-  if (type === 'reconnect') {
-    if (ws.room) return error(ws, 'Already in a room');
-    const room = rooms.get(String(msg.roomCode || '').trim().toUpperCase());
-    if (!room) return error(ws, 'Room not found');
-    const slot = room.players.findIndex(p => p && p.token === String(msg.reconnectToken || ''));
-    if (slot < 0 || room.players[slot]?.forfeited) return error(ws, 'Invalid reconnect token');
-    return attach(ws, room, slot);
-  }
-  const room = ws.room;
-  if (!room || room.players[ws.slot]?.ws !== ws) return error(ws, 'Join a room first');
-  room.lastActive = Date.now();
-  if (type === 'vote') {
-    if (room.started) return error(ws, 'Already started');
-    const p = room.players[ws.slot];
-    const map = Number(msg.map), diff = Number(msg.diff);
-    if (!Number.isInteger(map) || !Number.isInteger(diff) || map < 1 || map > p.maxMap || diff < 0 || diff > p.maxDiff || (p.unlockByMap && !Array.isArray(p.unlockByMap[map])) || (p.unlockByMap && !p.unlockByMap[map].includes(diff)))
-      return error(ws, 'Stage or difficulty not unlocked');
-    p.voteMap = map; p.voteDiff = diff;
-    return status(room);
-  }
-  if (type === 'ready') {
-    if (room.started) return error(ws, 'Already started');
-    room.players[ws.slot].ready = !!msg.ready;
-    if (msg.stats) room.players[ws.slot].stats = sanitizeStats(msg.stats);
-    return status(room);
-  }
-  if (type === 'start') {
-    if (ws.slot !== 0) return error(ws, 'Only host can start');
-    if (room.started) return error(ws, 'Already started');
-    if (!room.players.every(p => p?.ws && p.ready)) return error(ws, 'Both players must be connected and ready');
-    startGame(room, Math.max(...room.players.map(p => p.voteMap)), Math.max(...room.players.map(p => p.voteDiff)));
-    return;
-  }
-  // Replay immediately: no lobby/READY interruption for either player.
-  if (type === 'play_again') {
-    if (!room.started || !room.ended || !room.game) return error(ws, 'Finish the current run first');
-    const { map, diff } = room.game;
-    startGame(room, map, diff);
-    return;
-  }
-  // Difficulty change returns both players to the CO-OP lobby to vote again.
-  if (type === 'return_to_lobby') {
-    if (!room.started || !room.ended || !room.game) return error(ws, 'Finish the current run first');
-    room.started = false; room.ended = false; room.game = null;
-    for (const player of room.players) if (player) player.ready = false;
-    broadcast(room, { type: 'back_to_lobby' });
-    status(room);
-    return;
-  }
-  // Backward compatibility with the previous test client.
-  if (type === 'rematch') {
-    if (!room.started || !room.ended) return error(ws, 'Finish the current run first');
-    const p = room.players[ws.slot];
-    if (msg.diff !== undefined) {
-      const selected = Number(msg.diff);
-      if (!Number.isInteger(selected) || selected < 0 || selected > p.maxDiff)
-        return error(ws, 'Difficulty not unlocked');
-      p.voteDiff = selected;
-    }
-    const map = room.game.map;
-    const diff = room.game.diff;
-    room.started = false; room.ended = false; room.game = null;
-    for (const player of room.players) if (player) player.ready = false;
-    broadcast(room, { type: 'back_to_lobby', map, diff });
-    status(room);
-    return;
-  }
-  if(type === 'quit_game') {
-    // Voluntary surrender. The quitter's token is permanently revoked.
-    const p=room.players[ws.slot];
-    p.forfeited=true;p.token=crypto.randomBytes(24).toString('hex');p.ready=false;
-    send(ws,{type:'voluntary_quit_confirmed'});
-    const slot=ws.slot;
-    p.ws=null;ws.room=null;ws.slot=null;
-    status(room);
-    // The teammate's run and both automatic towers continue normally.
-    if(room.players.every(x=>!x?.ws))room.bothGoneAt=Date.now();
-    else room.bothGoneAt=null;
-    return;
-  }
-  if(type === 'leave_room') {
-    if(room.started&&!room.ended){
-      return error(ws,'During a run use quit_game with confirmation');
-    }
-    if(room.started&&room.ended){
-      const p=room.players[ws.slot];p.forfeited=true;p.token=crypto.randomBytes(24).toString('hex');
-      send(ws,{type:'voluntary_quit_confirmed'});p.ws=null;ws.room=null;ws.slot=null;
-      status(room);return;
-    }
-    broadcast(room,{type:'room_closed',message:'Lobby closed'});
-    for(const p of room.players)if(p?.ws){p.ws.room=null;p.ws.slot=null;}
-    rooms.delete(room.code);return;
-  }
-  if (type === 'upgrade') {
-    if (!room.started || room.ended) return error(ws, 'No active game');
-    const index = Number(msg.index);
-    if (!Number.isInteger(index) || index < 0 || index >= UPGRADES.length) return error(ws, 'Invalid upgrade');
-    if (!upgrade(room, ws.slot, index, msg.batch)) return error(ws, 'Not enough cash or max level');
-    broadcast(room, { type: 'game_state', ...snapshot(room.game) });
-    return;
-  }
-  if (type === 'set_speed') {
-    if (!room.started || room.ended) return error(ws, 'No active game');
-    const maxSpeed = Math.min(...room.players.map(p => p.maxSpeed));
-    const speed = Number(msg.speed);
-    if (!Number.isInteger(speed) || speed < 1 || speed > maxSpeed) return error(ws, 'Speed not unlocked for both players');
-    room.game.speed = speed;
-    return broadcast(room, { type: 'game_state', ...snapshot(room.game) });
-  }
-  if (type === 'end_run') {
-    if (!room.started || room.ended) return error(ws, 'No active game');
-    // Surviving player may end the run if their partner forfeits.
-    return finish(room, 'ended_by_host');
-  }
-  error(ws, 'Unknown message type');
 }
+
+function leaveRoom(ws, reason = 'player_left') {
+  const room = rooms.get(ws.roomCode) || ws.room;
+  if (!room) return;
+  const slot = ws.slot;
+  const p = room.players[slot];
+  ws.roomCode = null;
+  ws.room = null;
+  ws.slot = null;
+  if (!p) return;
+
+  if (!room.started) {
+    room.players[slot] = null;
+    const remaining = room.players.filter(Boolean);
+    if (!remaining.length) {
+      rooms.delete(room.code);
+      return;
+    }
+    // Compact slots if before game start so host is always present
+    if (!room.players[0]) {
+      const firstIdx = room.players.findIndex(Boolean);
+      if (firstIdx > 0) {
+        room.players[0] = room.players[firstIdx];
+        room.players[firstIdx] = null;
+        room.players[0].slot = 0;
+        if (room.players[0].ws) room.players[0].ws.slot = 0;
+      }
+    }
+    for (const pl of room.players) if (pl) pl.ready = false;
+    clampRoomStageToPlayers(room);
+    broadcast(room, { type: 'lobby', state: lobbyState(room) });
+    return;
+  }
+
+  // Voluntary quit during an active run: player forfeits their tower and leaves,
+  // while remaining connected players continue their run!
+  p.connected = false;
+  p.forfeited = true;
+  p.ws = null;
+  p.hp = 0;
+  p.shields = 0;
+  clearTimeout(p.disconnectTimer);
+
+  if (room.game) {
+    room.game.hp = room.players.filter(Boolean).reduce((sum, pl) => sum + Math.max(0, pl.hp), 0);
+    room.game.maxhp = room.players.filter(Boolean).reduce((sum, pl) => sum + pl.maxhp, 0);
+    room.game.shields = room.players.filter(Boolean).reduce((sum, pl) => sum + (pl.shields || 0), 0);
+  }
+
+  broadcast(room, {
+    type: 'player_status',
+    slot,
+    connected: false,
+    forfeited: true,
+    players: lobbyState(room).players
+  });
+
+  const activeRemaining = room.players.filter(pl => pl && !pl.forfeited && pl.connected);
+  const anyNonForfeited = room.players.filter(pl => pl && !pl.forfeited);
+  if (anyNonForfeited.length === 0 || (activeRemaining.length === 0 && !room.players.some(pl => pl && !pl.forfeited && pl.disconnectTimer))) {
+    finish(room, reason);
+    rooms.delete(room.code);
+  } else if (room.game && room.game.hp <= 0) {
+    finish(room, 'core_destroyed');
+    rooms.delete(room.code);
+  } else {
+    syncRoomSpeedCap(room);
+    broadcast(room, { type: 'state', state: snapshot(room) });
+    saveRooms();
+  }
+}
+
+function handleDisconnect(ws) {
+  if (ws.playerId && socketsByPlayer.get(ws.playerId) === ws) {
+    socketsByPlayer.delete(ws.playerId);
+    const acc = db.accounts[ws.playerId];
+    if (acc) notifyFriends(acc);
+  }
+  const room = rooms.get(ws.roomCode) || ws.room;
+  if (!room) return;
+  const p = room.players[ws.slot];
+  if (!p) return;
+  if (!room.started) {
+    leaveRoom(ws, 'disconnect');
+    return;
+  }
+  p.connected = false;
+  p.ws = null;
+  syncRoomSpeedCap(room);
+  broadcast(room, { type: 'player_status', slot: p.slot, connected: false, forfeited: !!p.forfeited, players: lobbyState(room).players });
+  clearTimeout(p.disconnectTimer);
+  p.disconnectTimer = setTimeout(() => {
+    p.disconnectTimer = null;
+    if (!p.connected && !room.ended) {
+      p.forfeited = true;
+      p.hp = 0;
+      p.shields = 0;
+      if (room.game) {
+        room.game.hp = room.players.filter(Boolean).reduce((sum, pl) => sum + Math.max(0, pl.hp), 0);
+        room.game.shields = room.players.filter(Boolean).reduce((sum, pl) => sum + (pl.shields || 0), 0);
+      }
+      const stillPlaying = room.players.filter(pl => pl && !pl.forfeited && pl.connected);
+      if (stillPlaying.length === 0) {
+        finish(room, 'disconnect_timeout');
+        rooms.delete(room.code);
+      } else if (room.game && room.game.hp <= 0) {
+        finish(room, 'core_destroyed');
+        rooms.delete(room.code);
+      } else {
+        broadcast(room, { type: 'player_status', slot: p.slot, connected: false, forfeited: true, players: lobbyState(room).players });
+        broadcast(room, { type: 'state', state: snapshot(room) });
+      }
+    }
+  }, RECONNECT_GRACE_MS);
+  if (p.disconnectTimer && typeof p.disconnectTimer.unref === 'function') p.disconnectTimer.unref();
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.css': 'text/css; charset=utf-8'
+};
+
 const server = http.createServer((req, res) => {
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, service: 'infinite-tower-coop', version: '0.4.0', rooms: rooms.size }));
-  } else { res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' })); }
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type, Authorization'
+    });
+    res.end();
+    return;
+  }
+
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+    res.end(JSON.stringify({ ok: true, version: Core.VERSION, rooms: rooms.size, uptime: Math.floor(process.uptime()), rewardsCount: Object.keys(rewardsDb).length }));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/claim_reward') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 64 * 1024) req.destroy();
+    });
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const rid = String(payload.resultId || '').trim();
+        const token = String(payload.idToken || payload.token || '').trim();
+        let pid = String(payload.playerId || '').trim();
+        let authUser = null;
+        if (token) {
+          authUser = await verifyFirebaseAuthToken(token);
+          if (authUser && authUser.uid) pid = authUser.uid;
+        }
+
+        const rec = rewardsDb[rid] || db.rewards[rid];
+        if (!rec) {
+          res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+          res.end(JSON.stringify({ ok: false, error: 'reward_not_found' }));
+          return;
+        }
+        if (rec.firebaseUid && pid && rec.firebaseUid !== pid) {
+          res.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+          res.end(JSON.stringify({ ok: false, error: 'player_mismatch' }));
+          return;
+        }
+        if (pid && rec.playerId && rec.playerId !== pid && (!rec.firebaseUid || rec.firebaseUid !== pid)) {
+          res.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+          res.end(JSON.stringify({ ok: false, error: 'player_mismatch' }));
+          return;
+        }
+        if (rec.claimed) {
+          // Idempotence & Résilience réseau : si c'est le même joueur (reconnexion après perte de paquet)
+          if (!rec.claimedByUid || rec.claimedByUid === pid || rec.playerId === pid || rec.firebaseUid === pid) {
+            res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+            res.end(JSON.stringify({ ok: true, alreadyClaimed: true, reward: rec, message: 'Recovered claimed reward idempotently' }));
+            return;
+          }
+          res.writeHead(409, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+          res.end(JSON.stringify({ ok: false, error: 'already_claimed', claimedAt: rec.claimedAt }));
+          return;
+        }
+
+        // Exécution de la transaction atomique Firestore si connectée
+        let fsCreditResult = null;
+        if (firestoreClient) {
+          try {
+            const fsRes = await executeFirestoreRewardTransaction(firestoreClient, pid || rec.firebaseUid, rid, rec);
+            if (fsRes.alreadyClaimed) {
+              rec.claimed = true;
+              rec.claimedAt = fsRes.claimedAt || Date.now();
+              rec.claimedByUid = pid || rec.firebaseUid;
+              rec.firestoreSynced = true;
+              saveRewards(true);
+              res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+              res.end(JSON.stringify({ ok: true, alreadyClaimed: true, reward: rec, message: 'Firestore already claimed' }));
+              return;
+            }
+            fsCreditResult = fsRes;
+          } catch (fsErr) {
+            console.error('Erreur transaction Firestore:', fsErr.message);
+          }
+        }
+
+        rec.claimed = true;
+        rec.claimedAt = Date.now();
+        rec.claimedByUid = pid || rec.playerId;
+        rec.firestoreSynced = true;
+        db.rewards[rid] = rec;
+        saveRewards(true);
+        saveDB(true);
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        res.end(JSON.stringify({ ok: true, reward: rec, firestoreTransaction: fsCreditResult }));
+      } catch (err) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/reward/')) {
+    const rid = url.pathname.replace('/reward/', '').trim();
+    const rec = rewardsDb[rid] || db.rewards[rid];
+    if (!rec) {
+      res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+    res.end(JSON.stringify({ ok: true, reward: rec }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/unclaimed_rewards') {
+    const pid = url.searchParams.get('playerId');
+    const list = Object.values(rewardsDb).filter(r => !r.claimed && (!pid || r.playerId === pid));
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+    res.end(JSON.stringify({ ok: true, count: list.length, rewards: list }));
+    return;
+  }
+
+  const rel = url.pathname === '/' ? '/combat-core.js' : url.pathname;
+  const safePath = path.normalize(rel).replace(/^(\.\.[/\\])+/, '');
+  const file = path.join(__dirname, safePath);
+  if (file.startsWith(__dirname) && fs.existsSync(file) && fs.statSync(file).isFile()) {
+    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'text/plain; charset=utf-8' });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
-const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_BYTES });
-wss.on('connection', ws => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-  ws.on('message', raw => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch { return error(ws, 'Invalid JSON'); }
-    try { onMessage(ws, msg); }
-    catch (err) { console.error('Message failed', err); error(ws, 'Server error'); }
-  });
-  ws.on('close', () => {
-    const room = ws.room;
-    if (!room || room.players[ws.slot]?.ws !== ws) return;
-    room.players[ws.slot].ws = null;
+
+const wss = new WebSocketServer({ server, maxPayload: MAX_MESSAGE_BYTES });
+
+function onMessage(ws, raw) {
+  let msg = raw;
+  if (typeof raw === 'string' || Buffer.isBuffer(raw)) {
+    if (Buffer.byteLength(raw) > MAX_MESSAGE_BYTES) return;
+    try { msg = JSON.parse(String(raw)); } catch (e) { return; }
+  }
+  if (!msg || typeof msg.type !== 'string') return;
+
+  if (msg.type === 'claim_reward') {
+    (async () => {
+      const rid = String(msg.resultId || '').trim();
+      const token = String(msg.idToken || msg.token || '').trim();
+      let pid = String(msg.playerId || ws.playerId || '').trim();
+      if (token) {
+        const verified = await verifyFirebaseAuthToken(token);
+        if (verified && verified.uid) pid = verified.uid;
+      }
+      const rec = rewardsDb[rid] || db.rewards[rid];
+      if (!rec) {
+        send(ws, { type: 'reward_claim_result', resultId: rid, ok: false, error: 'reward_not_found' });
+        return;
+      }
+      if (rec.firebaseUid && pid && rec.firebaseUid !== pid) {
+        send(ws, { type: 'reward_claim_result', resultId: rid, ok: false, error: 'player_mismatch' });
+        return;
+      }
+      if (pid && rec.playerId && rec.playerId !== pid && (!rec.firebaseUid || rec.firebaseUid !== pid)) {
+        send(ws, { type: 'reward_claim_result', resultId: rid, ok: false, error: 'player_mismatch' });
+        return;
+      }
+      if (rec.claimed) {
+        if (!rec.claimedByUid || rec.claimedByUid === pid || rec.playerId === pid || rec.firebaseUid === pid) {
+          send(ws, {
+            type: 'reward_claim_result',
+            resultId: rid,
+            ok: true,
+            alreadyClaimed: true,
+            coins: rec.coins,
+            diamonds: rec.diamonds,
+            xp: rec.xp,
+            wave: rec.wave
+          });
+          return;
+        }
+        send(ws, { type: 'reward_claim_result', resultId: rid, ok: false, error: 'already_claimed', claimedAt: rec.claimedAt });
+        return;
+      }
+
+      if (firestoreClient) {
+        try {
+          const fsRes = await executeFirestoreRewardTransaction(firestoreClient, pid || rec.firebaseUid, rid, rec);
+          if (fsRes.alreadyClaimed) {
+            rec.claimed = true;
+            rec.claimedAt = fsRes.claimedAt || Date.now();
+            rec.claimedByUid = pid || rec.firebaseUid;
+            rec.firestoreSynced = true;
+            saveRewards(true);
+            send(ws, {
+              type: 'reward_claim_result',
+              resultId: rid,
+              ok: true,
+              alreadyClaimed: true,
+              coins: rec.coins,
+              diamonds: rec.diamonds,
+              xp: rec.xp,
+              wave: rec.wave
+            });
+            return;
+          }
+        } catch (_) {}
+      }
+
+      rec.claimed = true;
+      rec.claimedAt = Date.now();
+      rec.claimedByUid = pid || rec.playerId;
+      rec.firestoreSynced = true;
+      db.rewards[rid] = rec;
+      saveRewards(true);
+      saveDB(true);
+      send(ws, {
+        type: 'reward_claim_result',
+        resultId: rid,
+        ok: true,
+        coins: rec.coins,
+        diamonds: rec.diamonds,
+        xp: rec.xp,
+        wave: rec.wave
+      });
+    })().catch(() => {});
+    return;
+  }
+
+  if (msg.type === 'ping') { send(ws, { type: 'pong', t: msg.t }); return; }
+
+  if (msg.type === 'register') {
+    const pid = id('IT');
+    const tok = token();
+    const acc = { id: pid, token: tok, name: cleanName(msg.name), friends: [], requests: [], createdAt: Date.now() };
+    db.accounts[pid] = acc;
+    saveDB();
+    send(ws, { type: 'registered', id: pid, token: tok, name: acc.name });
+    return;
+  }
+
+  if (msg.type === 'login') {
+    const acc = db.accounts[String(msg.id || '')];
+    if (!acc || acc.token !== String(msg.token || '')) {
+      send(ws, { type: 'error', message: 'Invalid account credentials' });
+      return;
+    }
+    if (msg.name) acc.name = cleanName(msg.name);
+    ws.playerId = acc.id;
+    ws.playerName = acc.name;
+    socketsByPlayer.set(acc.id, ws);
+    saveDB();
+    send(ws, {
+      type: 'logged_in',
+      profile: publicProfile(acc),
+      friends: (acc.friends || []).map(friendStatus).filter(Boolean),
+      requests: (acc.requests || []).map(rid => db.accounts[rid]).filter(Boolean).map(publicProfile)
+    });
+    notifyFriends(acc);
+    return;
+  }
+
+  if (msg.type === 'friends') {
+    const acc = db.accounts[ws.playerId];
+    if (acc) sendFriends(acc, ws);
+    return;
+  }
+
+  if (msg.type === 'friend_request') {
+    const me = db.accounts[ws.playerId];
+    const target = db.accounts[String(msg.friendId || '').trim().toUpperCase()];
+    if (!me || !target || me.id === target.id) {
+      send(ws, { type: 'error', message: 'Player ID not found' });
+      return;
+    }
+    target.requests = target.requests || [];
+    me.friends = me.friends || [];
+    if (!me.friends.includes(target.id) && !target.requests.includes(me.id)) {
+      target.requests.push(me.id);
+      saveDB();
+      const tws = socketsByPlayer.get(target.id);
+      if (tws) send(tws, { type: 'friend_request', from: publicProfile(me) });
+    }
+    sendFriends(me, ws);
+    return;
+  }
+
+  if (msg.type === 'friend_accept') {
+    const me = db.accounts[ws.playerId];
+    const from = db.accounts[String(msg.friendId || '').trim().toUpperCase()];
+    if (!me || !from) return;
+    me.requests = (me.requests || []).filter(x => x !== from.id);
+    me.friends = me.friends || [];
+    from.friends = from.friends || [];
+    if (!me.friends.includes(from.id)) me.friends.push(from.id);
+    if (!from.friends.includes(me.id)) from.friends.push(me.id);
+    saveDB();
+    sendFriends(me, ws);
+    const fws = socketsByPlayer.get(from.id);
+    if (fws) { send(fws, { type: 'friend_accepted', friend: publicProfile(me) }); sendFriends(from, fws); }
+    notifyFriends(me);
+    notifyFriends(from);
+    return;
+  }
+
+  if (msg.type === 'invite') {
+    const me = db.accounts[ws.playerId];
+    const room = rooms.get(ws.roomCode) || ws.room;
+    const fws = socketsByPlayer.get(String(msg.friendId || '').trim().toUpperCase());
+    if (!me || !room) { send(ws, { type: 'error', message: 'Create a CO-OP room first' }); return; }
+    if (fws) send(fws, { type: 'invite', from: publicProfile(me), code: room.code });
+    send(ws, { type: 'invite_sent', online: !!fws });
+    return;
+  }
+
+  if (msg.type === 'host' || msg.type === 'create_room') {
+    if (ws.roomCode || ws.room) leaveRoom(ws, 'switch_room');
+    const { room, reconnectToken } = makeRoom(ws, msg);
+    send(ws, { type: 'created', roomCode: room.code, code: room.code, slot: 0, reconnectToken, state: lobbyState(room) });
+    return;
+  }
+
+  if (msg.type === 'join' || msg.type === 'join_room') {
+    const code = String(msg.code || msg.roomCode || '').trim().toUpperCase();
+    const room = rooms.get(code);
+    if (!room) { send(ws, { type: 'error', message: 'Room not found' }); return; }
+    const emptySlot = room.players.findIndex(p => p === null);
+    if (room.started || emptySlot === -1) { send(ws, { type: 'error', message: 'Room is full or already started' }); return; }
+    if (ws.roomCode || ws.room) leaveRoom(ws, 'switch_room');
+    const rToken = token();
+    const initUp = safeInitialUpgrades(msg.initialUpgrades);
+    const perm = safeProfile(msg.profile || msg.permanentProfile, initUp);
+    room.players[emptySlot] = {
+      slot: emptySlot,
+      id: ws.playerId || id('P'),
+      firebaseUid: String(msg.firebaseUid || ws.firebaseUid || '').trim() || null,
+      name: cleanName(msg.name || ws.playerName),
+      ready: false,
+      connected: true,
+      forfeited: false,
+      reconnectToken: rToken,
+      maxSpeed: clampInt(msg.maxSpeed, 1, 10, 1),
+      unlocks: safeUnlocks(msg.unlocks),
+      stats: safeStats(msg.stats),
+      initialUpgrades: initUp,
+      permanent: perm,
+      startingCash: clampInt(msg.startingCash, 0, 1e9, perm.effects.startupCash || 80),
+      allowedUpgrades: safeAllowedUpgrades(msg.allowedUpgrades),
+      up: Array(UPS.length).fill(0),
+      purchased: Array(UPS.length).fill(0),
+      cash: clampInt(msg.startingCash, 0, 1e9, perm.effects.startupCash || 80),
+      ws,
+      disconnectTimer: null
+    };
+    ws.roomCode = room.code;
+    ws.room = room;
+    ws.slot = emptySlot;
     room.lastActive = Date.now();
-    if (room.players.every(p => !p?.ws)) room.bothGoneAt = Date.now();
-    status(room);
-  });
+    clampRoomStageToPlayers(room);
+    send(ws, { type: 'joined', roomCode: room.code, code: room.code, slot: emptySlot, reconnectToken: rToken, state: lobbyState(room) });
+    broadcast(room, { type: 'lobby', state: lobbyState(room) });
+    saveRooms();
+    return;
+  }
+
+  if (msg.type === 'reconnect_room') {
+    const code = String(msg.code || msg.roomCode || '').trim().toUpperCase();
+    const room = rooms.get(code);
+    if (!room) { send(ws, { type: 'error', message: 'Room expired' }); return; }
+    const reqToken = String(msg.reconnectToken || '').trim();
+    if (!reqToken) { send(ws, { type: 'error', message: 'Reconnect token required' }); return; }
+    const p = room.players.find(x => x && !x.forfeited && x.reconnectToken === reqToken);
+    if (!p) { send(ws, { type: 'error', message: 'Reconnect token invalid' }); return; }
+    clearTimeout(p.disconnectTimer);
+    p.disconnectTimer = null;
+    p.connected = true;
+    p.ws = ws;
+    ws.roomCode = room.code;
+    ws.room = room;
+    ws.slot = p.slot;
+    room.lastActive = Date.now();
+    syncRoomSpeedCap(room);
+    send(ws, { type: 'reconnected', roomCode: room.code, code: room.code, slot: p.slot, state: snapshot(room) });
+    broadcast(room, { type: 'player_status', slot: p.slot, connected: true, forfeited: false, players: lobbyState(room).players });
+    saveRooms();
+    return;
+  }
+
+  const room = rooms.get(ws.roomCode) || ws.room;
+  if (!room) return;
+  room.lastActive = Date.now();
+  const p = room.players[ws.slot];
+  if (!p) return;
+
+  if (msg.type === 'ready') {
+    p.ready = msg.ready !== undefined ? !!msg.ready : !p.ready;
+    if (msg.idToken) {
+      verifyFirebaseAuthToken(msg.idToken).then(v => {
+        if (v && v.uid) {
+          if (p.firebaseUid && p.firebaseUid !== v.uid) {
+            send(ws, { type: 'error', code: 'identity_tampering', message: 'Cannot alter verified Firebase UID' });
+            return;
+          }
+          p.firebaseUid = v.uid;
+        } else {
+          send(ws, { type: 'error', code: 'invalid_token', message: 'Firebase token verification failed' });
+        }
+      }).catch(() => {});
+    } else if (msg.firebaseUid) {
+      const candidateUid = String(msg.firebaseUid).trim();
+      if (p.firebaseUid && p.firebaseUid !== candidateUid) {
+        send(ws, { type: 'error', code: 'identity_tampering', message: 'Cannot alter bound Firebase identity' });
+        return;
+      }
+      if (!p.firebaseUid && process.env.NODE_ENV !== 'production') {
+        p.firebaseUid = candidateUid;
+      }
+    }
+    if (msg.stats) p.stats = safeStats(msg.stats);
+    if (msg.initialUpgrades) p.initialUpgrades = safeInitialUpgrades(msg.initialUpgrades);
+    if (msg.profile || msg.permanentProfile) p.permanent = safeProfile(msg.profile || msg.permanentProfile, p.initialUpgrades);
+    if (msg.startingCash !== undefined) p.startingCash = clampInt(msg.startingCash, 0, 1e9, p.permanent?.effects?.startupCash || 80);
+    if (msg.allowedUpgrades) p.allowedUpgrades = safeAllowedUpgrades(msg.allowedUpgrades);
+    if (msg.maxSpeed) p.maxSpeed = clampInt(msg.maxSpeed, 1, 10, 1);
+    if (msg.unlocks) { p.unlocks = safeUnlocks(msg.unlocks); clampRoomStageToPlayers(room); }
+    broadcast(room, { type: 'lobby', state: lobbyState(room) });
+    startGame(room, undefined, undefined, true);
+    return;
+  }
+
+  if (msg.type === 'start') {
+    startGame(room, undefined, undefined, true);
+    return;
+  }
+
+  if (msg.type === 'select_stage' && ws.slot === 0 && !room.started) {
+    const nextMap = clampInt(msg.map, 1, 10, room.map);
+    const nextDiff = clampInt(msg.diff, 0, DIFF_MULT.length - 1, room.diff);
+    if (!roomUnlockedForAll(room, nextMap, nextDiff)) {
+      send(ws, { type: 'error', message: 'Stage locked for at least one player' });
+      return;
+    }
+    room.map = nextMap;
+    room.diff = nextDiff;
+    broadcast(room, { type: 'lobby', state: lobbyState(room) });
+    return;
+  }
+
+  if (msg.type === 'set_target_priority' && room.started && room.game) {
+    if (Core.TARGET_PRIORITY_MODES.includes(msg.priority)) {
+      p.targetPriority = msg.priority;
+      if (room.game.towers && room.game.towers[ws.slot]) {
+        room.game.towers[ws.slot].targetPriority = msg.priority;
+      }
+      broadcast(room, { type: 'state', state: snapshot(room) });
+    }
+    return;
+  }
+
+  if (msg.type === 'upgrade' && room.started && room.game) {
+    const batch = msg.batch === 'max' ? 'max' : clampInt(msg.batch, 1, 1000, 1);
+    if (upgrade(room, ws.slot, clampInt(msg.index, -1, UPS.length, -1), batch)) {
+      broadcast(room, { type: 'state', state: snapshot(room) });
+    }
+    return;
+  }
+
+  if (msg.type === 'set_speed' && room.started && room.game) {
+    const commonMax = getRoomMaxSpeed(room);
+    const curSpd = room.game.speed || room.speed || 1;
+    let targetSpeed;
+    if (msg.action === 'plus') {
+      targetSpeed = Math.min(commonMax, curSpd + 1);
+    } else if (msg.action === 'minus') {
+      targetSpeed = Math.max(1, curSpd - 1);
+    } else {
+      const parsed = Math.round(Number(msg.speed) || 1);
+      if (parsed < 1) {
+        send(ws, { type: 'error', message: 'Pause not allowed in CO-OP' });
+        return;
+      }
+      targetSpeed = Math.max(1, Math.min(commonMax, parsed));
+    }
+    room.game.speed = targetSpeed;
+    room.speed = targetSpeed;
+    broadcast(room, { type: 'speed_changed', speed: room.game.speed, by: ws.slot, maxSpeed: commonMax });
+    broadcast(room, { type: 'state', state: snapshot(room) });
+    return;
+  }
+
+  if (msg.type === 'leave_room') {
+    leaveRoom(ws, 'player_left');
+  }
+}
+
+wss.on('connection', ws => {
+  ws.alive = true;
+  ws.on('pong', () => { ws.alive = true; });
+  ws.on('close', () => handleDisconnect(ws));
+  ws.on('error', () => {});
+  ws.on('message', raw => onMessage(ws, raw));
 });
-setInterval(() => {
+
+let lastTick = Date.now();
+let lastSnap = Date.now();
+let lastPeriodicSave = Date.now();
+const tickTimer = setInterval(() => {
   const now = Date.now();
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) { ws.terminate(); continue; }
-    ws.isAlive = false; ws.ping();
+  const dt = (now - lastTick) / 1000;
+  lastTick = now;
+  const sendSnap = now - lastSnap >= SNAPSHOT_MS;
+  if (sendSnap) lastSnap = now;
+  if (now - lastPeriodicSave >= 5000) {
+    lastPeriodicSave = now;
+    if (rooms.size > 0) saveRooms();
   }
+
   for (const [code, room] of rooms) {
-    if (room.bothGoneAt && room.started && !room.ended && now - room.bothGoneAt >= DISCONNECT_GRACE_MS) finish(room, 'both_disconnected');
-    if (room.bothGoneAt && now - room.bothGoneAt >= IDLE_ROOM_MS) rooms.delete(code);
-  }
-}, 30_000).unref();
-setInterval(() => {
-  const now = Date.now();
-  for (const room of rooms.values()) {
-    if (!room.started || room.ended) continue;
-    const g = room.game;
-    const dt = Math.min(.15, (now - g.lastTime) / 1000);
-    g.lastTime = now;
-    const reason = tick(g, dt);
-    if (reason) { finish(room, reason); continue; }
-    if (now - room.lastSnapshot >= SNAPSHOT_MS) {
-      room.lastSnapshot = now;
-      broadcast(room, { type: 'game_state', ...snapshot(g) });
+    if (now - room.lastActive > ROOM_IDLE_MS) {
+      finish(room, 'idle_timeout');
+      rooms.delete(code);
+      saveRooms();
+      continue;
+    }
+    if (!room.started || !room.game || room.ended) continue;
+    tick(room.game, dt);
+    if (room.game.over) {
+      finish(room, room.game.reason);
+      rooms.delete(code);
+      saveRooms();
+    } else {
+      if (room.game.wave !== room._lastSavedWave) {
+        room._lastSavedWave = room.game.wave;
+        saveRooms();
+      }
+      if (sendSnap) {
+        broadcast(room, { type: 'state', state: snapshot(room) });
+      }
     }
   }
-}, TICK_MS).unref();
-if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Infinite Tower CO-OP v0.4 listening on ${PORT}`));
-module.exports = { server, rooms, onMessage, tick, startGame, snapshot, upgrade, finish, sanitizeStats };
+}, TICK_MS);
+if (tickTimer && typeof tickTimer.unref === 'function') tickTimer.unref();
+
+const heartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.alive === false) { ws.terminate(); continue; }
+    ws.alive = false;
+    try { ws.ping(); } catch (e) {}
+  }
+}, HEARTBEAT_MS);
+if (heartbeatTimer && typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+
+function gracefulShutdown(signal) {
+  console.log(`[SERVER] Received ${signal}. Flushing active rooms, accounts, and rewards to disk...`);
+  try { saveRooms(true); } catch (e) {}
+  try { saveRewards(true); } catch (e) {}
+  try { saveDB(true); } catch (e) {}
+  console.log('[SERVER] Persistence flush complete. Exiting gracefully.');
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Infinite Tower CO-OP server (${Core.VERSION}) listening on :${PORT}`);
+  });
+}
+
+module.exports = {
+  server,
+  rooms,
+  Core,
+  tick,
+  startGame,
+  finish,
+  snapshot,
+  onMessage,
+  onClose: handleDisconnect,
+  handleDisconnect,
+  saveRooms,
+  loadRooms,
+  serializeRooms: saveRooms,
+  db,
+  rewardsDb,
+  saveRewards,
+  loadRewards,
+  verifyFirebaseAuthToken,
+  registerTestPublicKey,
+  setFirestoreInstance,
+  getFirestoreInstance,
+  executeFirestoreRewardTransaction,
+  syncRoomsToFirestore,
+  loadRoomsFromFirestore,
+  restoreRoomsFromFirestore,
+  reconstructRoom,
+  atomicWriteFileSync
+};
