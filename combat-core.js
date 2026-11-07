@@ -2078,8 +2078,17 @@
     report.diamondsBefore = state.diamonds;
 
     if (!Array.isArray(state.workshop)) {
-      if (state.workshop !== undefined) report.corruptedInputFixed = true;
-      state.workshop = Array(UPS.length).fill(0);
+      const cleanW = Array(UPS.length).fill(0);
+      if (state.workshop && typeof state.workshop === 'object') {
+        for (let i = 0; i < UPS.length; i++) {
+          if (state.workshop[i] !== undefined) {
+            cleanW[i] = safeNonNegInt(state.workshop[i], 0);
+          }
+        }
+      } else if (state.workshop !== undefined) {
+        report.corruptedInputFixed = true;
+      }
+      state.workshop = cleanW;
     } else {
       const cleanW = Array(UPS.length).fill(0);
       for (let i = 0; i < UPS.length; i++) {
