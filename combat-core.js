@@ -1167,10 +1167,12 @@
         burstChance: Math.min(1, Math.max(0, Math.min(40, (Number(effUp?.[24]) || 0) + (Number(effUp?.[34]) || 0)) * 0.025, (Number(baseEff.burstChance ?? baseEff.burstChanceBonus) || 0) + (Number(ru[24]) || 0) * 0.025)),
         multishotChance: Math.min(1, Math.max(0, Math.min(40, Number(effUp?.[35]) || 0) * 0.025, (Number(baseEff.multishotChance) || (Number(wl[35]) || 0) * 0.025) + (Number(ru[35]) || 0) * 0.025)),
         bounceChance: Math.min(1, Math.max(0, Math.min(40, Number(effUp?.[36]) || 0) * 0.025, (Number(baseEff.bounceChance) || (Number(wl[36]) || 0) * 0.025) + (Number(ru[36]) || 0) * 0.025)),
-        rapidFireChance: Math.min(1, Math.max(0, (Number(baseEff.rapidFireChance) || (Number(wl[37]) || 0) * 0.01) + (Number(ru[37]) || 0) * 0.01)),
+        rapidFireChance: Math.min(1.0, Math.max(0, (Number(baseEff.rapidFireChance) || (Number(wl[37]) || 0) * 0.025) + (Number(ru[37]) || 0) * 0.025)),
         rapidFireMultiplier: Math.max(1, Number(baseEff.rapidFireMultiplier ?? p.stats?.rapidFireMultiplier) || 1),
         bounceCount: Math.min(5, Math.max(0, Number(baseEff.bounceCount ?? p.stats?.bounceCount) || 0)),
-        lifeOnWaveEnd: Math.min(0.5, Math.max(0, Number(baseEff.lifeOnWaveEnd ?? baseEff.waveEndHeal ?? p.stats?.waveEndHeal) || (Number(wl[38]) || 0) * 0.005))
+        lifeOnWaveEnd: Math.min(0.5, Math.max(0, Number(baseEff.lifeOnWaveEnd ?? baseEff.waveEndHeal ?? p.stats?.waveEndHeal) || (Number(wl[38]) || 0) * 0.005)),
+        overcritChance: Math.min(1.0, Math.max(0, (Number(baseEff.overcritChance) || (Number(wl[41]) || 0) * 0.025) + (Number(ru[41]) || 0) * 0.025)),
+        overcritDamage: Math.max(2.0, Number(baseEff.overcritDamage || 2.0) + (Number(ru[42]) || 0) * 0.10)
       };
     };
 
