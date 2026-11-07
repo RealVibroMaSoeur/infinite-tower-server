@@ -186,6 +186,7 @@ function saveDB(sync = false) {
   clearTimeout(saveTimer);
   const write = () => {
     try { atomicWriteFileSync(DATA_FILE, JSON.stringify(db, null, 2)); } catch (e) {}
+    if (firestoreClient) syncSocialToFirestore(sync).catch(() => {});
   };
   if (sync) write();
   else saveTimer = setTimeout(write, 150);
@@ -221,7 +222,36 @@ const rooms = new Map();
 let firestoreClient = null;
 function setFirestoreInstance(instance) {
   firestoreClient = instance;
+  if (firestoreClient) loadSocialFromFirestore().catch(() => {});
 }
+let lastFirestoreSocialSync = 0;
+async function syncSocialToFirestore(force = false) {
+  if (!firestoreClient) return;
+  const now = Date.now();
+  if (!force && (now - lastFirestoreSocialSync < 5000)) return;
+  lastFirestoreSocialSync = now;
+  try {
+    const docRef = firestoreClient.collection('coop_social').doc('accounts');
+    await docRef.set({ accounts: db.accounts || {}, updatedAt: now }, { merge: true });
+  } catch (_) {}
+}
+
+async function loadSocialFromFirestore() {
+  if (!firestoreClient) return false;
+  try {
+    const docSnap = await firestoreClient.collection('coop_social').doc('accounts').get();
+    if (docSnap && docSnap.exists) {
+      const data = typeof docSnap.data === 'function' ? docSnap.data() : docSnap.data;
+      if (data && typeof data.accounts === 'object') {
+        db.accounts = { ...(db.accounts || {}), ...data.accounts };
+        try { atomicWriteFileSync(DATA_FILE, JSON.stringify(db, null, 2)); } catch (_) {}
+        return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
 function getFirestoreInstance() {
   return firestoreClient;
 }
@@ -939,7 +969,13 @@ function tick(g, dt) {
     remaining -= slice;
     const result = Core.stepCombat(g, slice, {
       getEffectiveUp: getEffUp,
-      getTowerStats: (p) => towerStats(g, p)
+      getTowerStats: (p) => towerStats(g, p),
+      onKill: (e, killer) => {
+        if (e && e.type) {
+          g.pendingKills = g.pendingKills || [];
+          g.pendingKills.push(e.type);
+        }
+      }
     });
     if (result === 'core_destroyed' || result === 'max_wave') {
       g.over = true;
@@ -1070,7 +1106,8 @@ function snapshot(roomOrGame) {
     } : null),
     enemies: (g.enemies || []).slice(0, 80).map(e => [e.id, Math.round(e.x), Math.round(e.y), Math.round(e.hp), Math.round(e.max), e.type, e.isGiant ? (e.giantFactor || 6) : 0]),
     bullets: (g.bullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y), Math.round(b.txX ?? b.tx?.x ?? 0), Math.round(b.txY ?? b.tx?.y ?? 0), b.slot, b.overcrit ? 2 : (b.crit ? 1 : 0)]),
-    enemyBullets: (g.enemyBullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y)])
+    enemyBullets: (g.enemyBullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y)]),
+    authoritativeKills: (g.pendingKills || []).splice(0)
   };
 }
 
@@ -1916,6 +1953,8 @@ module.exports = {
   verifyFirebaseAuthToken,
   registerTestPublicKey,
   setFirestoreInstance,
+  loadSocialFromFirestore,
+  syncSocialToFirestore,
   getFirestoreInstance,
   executeFirestoreRewardTransaction,
   syncRoomsToFirestore,

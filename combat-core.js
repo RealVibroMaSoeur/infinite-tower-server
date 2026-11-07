@@ -926,7 +926,7 @@
       rapidFireMultiplier: 1 + (wl(9) + ru(9) + lb('Rapid Fire', 9)) * 0.02,
       bounceCount: Math.min(5, Math.max(0, wl(10) + ru(10) + lb('Bounce Count', 10))),
       lifeOnWaveEnd: Math.min(0.5, Math.max(0, (wl(38) + lb('Life on Wave End', 38)) * 0.005)),
-      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 100,
+      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 10,
       overcritChance: Math.min(1.0, Math.max(0, (wl(41) * 0.025) + (lb('Overcrit Chance', 41) * 0.025) + (ru(41) * 0.025))),
       overcritDamage: 2.0 + (wl(42) + lb('Overcrit Damage', 42) + ru(42)) * 0.10
     };
@@ -1133,6 +1133,7 @@
   // Unified per-step combat engine used by both SOLO and CO-OP server
   function stepCombat(state, dt, hooks = {}) {
     if (!state || !(dt > 0)) return null;
+    const options = (typeof hooks === 'object' && hooks !== null) ? hooks : {};
     const rng = typeof hooks === 'function' ? hooks : (typeof hooks?.rng === 'function' ? hooks.rng : Math.random);
     const isMulti = Array.isArray(state.players) && state.players.length > 0;
     const towers = isMulti ? state.players : [state];
@@ -1359,7 +1360,7 @@
         p.interestTimer -= 10;
         const gained = interestCash(p.cash, effUp[20]) * (1 + (Number(boosters.interest) || 0));
         p.cash += gained;
-        if (gained > 0 && options && typeof options.onInterestGain === 'function') {
+        if (gained > 0 && typeof options.onInterestGain === 'function') {
           options.onInterestGain({ x: ox, y: oy, slot: p.slot ?? 0, amount: Math.round(gained) });
         }
       }
@@ -1551,7 +1552,7 @@
         shooter.damageDealt = shooter.damageDealt || {};
         shooter.damageDealt.Direct = (shooter.damageDealt.Direct || 0) + actualDamage;
 
-        if (options && typeof options.onHitDamage === 'function') {
+        if (typeof options.onHitDamage === 'function') {
           options.onHitDamage({
             x: e.x,
             y: e.y,
