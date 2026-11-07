@@ -1,10 +1,11 @@
 {
   "name": "infinite-tower-coop",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js", "test": "node test_shared.js"
+    "start": "node server.js",
+    "test": "node test_shared.js"
   },
   "engines": {
     "node": ">=20"

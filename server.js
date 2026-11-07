@@ -284,7 +284,7 @@ async function executeFirestoreRewardTransaction(firestore, uid, resultId, rewar
         data: JSON.stringify(saveDataObj),
         updatedAt: Date.now(),
         format: 'json',
-        version: '2.1.4',
+        version: '2.1.5',
         saveVersion: 'v56'
       }, { merge: true });
     }
@@ -770,6 +770,7 @@ function makeRoom(hostWs, msg) {
         id: hostWs.playerId || id('P'),
         firebaseUid: String(msg.firebaseUid || hostWs.firebaseUid || '').trim() || null,
         name: cleanName(msg.name || hostWs.playerName),
+        skin: String(msg.skin || 'Classic').trim().slice(0, 32),
         ready: false,
         connected: true,
         forfeited: false,
@@ -815,6 +816,7 @@ function lobbyState(room) {
       slot: idx,
       id: p.id,
       name: p.name,
+      skin: p.skin || 'Classic',
       ready: !!p.ready,
       connected: !!p.connected,
       forfeited: !!p.forfeited,
@@ -951,7 +953,33 @@ function upgrade(room, slot, index, batch = 1) {
   const g = room.game;
   const p = room.players[slot];
   if (!g || !p || p.forfeited || !Number.isInteger(index) || index < 0 || index >= UPS.length) return false;
+  if (p.hp <= 0) return false; // Modif #14: KO players cannot buy upgrades
   if (Array.isArray(p.allowedUpgrades) && !p.allowedUpgrades.includes(index)) return false;
+
+  // Modif #15: Strict all-or-nothing check for batch 10 and 100
+  if (batch === 10 || batch === 100) {
+    const effUp = effectiveLevels(p);
+    const eff = Core.computeUpgradeEffects(p.permanent?.workshopLevels || p.initialUpgrades, p.up, {});
+    const st = towerStats(g, p);
+    const permanentHeal = Math.min(0.5, (p.stats.waveEndHeal || 0) + (eff.lifeOnWaveEnd || 0));
+    const currentHeal = Core.waveEndHealFraction(permanentHeal, (p.up[40] || 0) * 0.005);
+    const freeLabBonus = Number(p.permanent?.labs?.freeUpgrade?.[index - 29]) || 0;
+
+    const quote = Core.batchUpgradeQuote({
+      index,
+      currentLevel: p.up[index] || 0,
+      cash: p.cash,
+      requestedBatch: batch,
+      effectiveUp: effUp,
+      stats: st,
+      effects: eff,
+      waveEndHeal: currentHeal,
+      freeUpgradeLabLevel: freeLabBonus
+    });
+    if (quote.allOrNothingFailed || quote.count < batch || p.cash < quote.totalCost) {
+      return false;
+    }
+  }
 
   const limit = batch === 'max' ? 1000 : clampInt(batch, 1, 1000, 1);
   let count = 0;
@@ -1008,6 +1036,7 @@ function snapshot(roomOrGame) {
     code: room ? room.code : undefined,
     started: true,
     wave: g.wave,
+    waveTime: Number((g.waveTime || 0).toFixed(2)),
     map: room ? room.map : g.map,
     diff: room ? room.diff : g.diff,
     speed: g.speed,
@@ -1024,6 +1053,7 @@ function snapshot(roomOrGame) {
       slot: p.slot ?? idx,
       id: p.id,
       name: p.name,
+      skin: p.skin || 'Classic',
       connected: !!p.connected,
       forfeited: !!p.forfeited,
       cash: Math.floor(p.cash),
@@ -1039,7 +1069,7 @@ function snapshot(roomOrGame) {
       pos: Core.TOWER_POSITIONS[p.slot ?? idx]
     } : null),
     enemies: (g.enemies || []).slice(0, 80).map(e => [e.id, Math.round(e.x), Math.round(e.y), Math.round(e.hp), Math.round(e.max), e.type, e.isGiant ? (e.giantFactor || 6) : 0]),
-    bullets: (g.bullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y), Math.round(b.txX ?? b.tx?.x ?? 0), Math.round(b.txY ?? b.tx?.y ?? 0), b.slot, b.crit ? 1 : 0]),
+    bullets: (g.bullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y), Math.round(b.txX ?? b.tx?.x ?? 0), Math.round(b.txY ?? b.tx?.y ?? 0), b.slot, b.overcrit ? 2 : (b.crit ? 1 : 0)]),
     enemyBullets: (g.enemyBullets || []).slice(0, 60).map(b => [Math.round(b.x), Math.round(b.y)])
   };
 }
@@ -1050,25 +1080,36 @@ function finish(room, reason) {
   const g = room.game;
   if (!room.resultIds) room.resultIds = {};
   if (!db.rewards) db.rewards = {};
+
+  const rawWave = g ? g.wave : 1;
+  const creditedWave = (rawWave >= 5000 && (!g || !g.wave5000Cleared) && reason !== 'max_wave' && reason !== 'Wave Complete')
+    ? 4999
+    : Math.min(5000, rawWave);
+
+  // Modif #20: Shared CO-OP Rewards
+  const activePlayers = room.players.filter(pl => pl && !pl.forfeited);
+  const avgCoinBonus = activePlayers.length > 0 ? (activePlayers.reduce((sum, pl) => sum + (pl.stats?.coinBonus || 1), 0) / activePlayers.length) : 1;
+  const avgXpBonus = activePlayers.length > 0 ? (activePlayers.reduce((sum, pl) => sum + (pl.stats?.xpBonus || 1), 0) / activePlayers.length) : 1;
+  const sharedGold = g ? g.gold : 0;
+  const sharedXP = g ? g.xp : 0;
+  const sharedDiamonds = g ? g.diamonds : 0;
+  const commonRewards = Core.calculateRunRewards({
+    earnedGold: sharedGold,
+    earnedXP: sharedXP,
+    wave: creditedWave,
+    map: room.map || 1,
+    diff: room.diff || 0,
+    coinBonus: avgCoinBonus,
+    xpBonus: avgXpBonus,
+    diamonds: sharedDiamonds
+  });
+
   room.players.forEach((p, idx) => {
     if (!p || p.forfeited) return;
     const slot = p.slot ?? idx;
     if (!room.resultIds[slot]) room.resultIds[slot] = crypto.randomBytes(16).toString('hex');
     const resId = room.resultIds[slot];
-    const rawWave = g ? g.wave : 1;
-    const creditedWave = (rawWave >= 5000 && (!g || !g.wave5000Cleared) && reason !== 'max_wave' && reason !== 'Wave Complete')
-      ? 4999
-      : Math.min(5000, rawWave);
-    const rewards = Core.calculateRunRewards({
-      earnedGold: p.earnedGold !== undefined ? p.earnedGold : (g ? g.gold : 0),
-      earnedXP: p.earnedXP !== undefined ? p.earnedXP : (g ? g.xp : 0),
-      wave: creditedWave,
-      map: room.map || 1,
-      diff: room.diff || 0,
-      coinBonus: p.stats?.coinBonus || 1,
-      xpBonus: p.stats?.xpBonus || 1,
-      diamonds: g ? g.diamonds : 0
-    });
+
     // Registre persistant anti-duplication des récompenses côté serveur
     const rewardRecord = {
       resultId: resId,
@@ -1077,9 +1118,9 @@ function finish(room, reason) {
       firebaseUid: p.firebaseUid || null,
       roomCode: room.code,
       wave: creditedWave,
-      coins: rewards.coins,
-      diamonds: rewards.diamonds,
-      xp: rewards.xp,
+      coins: commonRewards.coins,
+      diamonds: commonRewards.diamonds,
+      xp: commonRewards.xp,
       finishedAt: Date.now(),
       reason,
       claimed: false,
@@ -1098,9 +1139,9 @@ function finish(room, reason) {
       wave: creditedWave,
       kills: g ? g.kills : 0,
       playerKills: p.kills || 0,
-      coins: rewards.coins,
-      diamonds: rewards.diamonds,
-      xp: rewards.xp,
+      coins: commonRewards.coins,
+      diamonds: commonRewards.diamonds,
+      xp: commonRewards.xp,
       elapsed: g ? Math.floor(g.elapsed || 0) : 0,
       map: room.map || 1,
       diff: room.diff || 0
@@ -1116,7 +1157,7 @@ function getRoomMaxSpeed(room) {
   const activePlayers = room.players.filter(p => p && !p.forfeited && p.connected !== false);
   if (!activePlayers.length) return 1;
   const limits = activePlayers.map(p => Math.max(1, Math.min(10, Math.floor(Number(p.maxSpeed) || 1))));
-  return Math.min(...limits);
+  return Math.max(...limits);
 }
 
 function syncRoomSpeedCap(room) {
@@ -1591,6 +1632,7 @@ function onMessage(ws, raw) {
       id: ws.playerId || id('P'),
       firebaseUid: String(msg.firebaseUid || ws.firebaseUid || '').trim() || null,
       name: cleanName(msg.name || ws.playerName),
+      skin: String(msg.skin || 'Classic').trim().slice(0, 32),
       ready: false,
       connected: true,
       forfeited: false,
@@ -1648,6 +1690,35 @@ function onMessage(ws, raw) {
   const p = room.players[ws.slot];
   if (!p) return;
 
+  if (msg.type === 'restart_lobby' && room) {
+    if (room.ended || (room.game && room.game.reason)) {
+      if (room.tickTimer) {
+        clearInterval(room.tickTimer);
+        room.tickTimer = null;
+      }
+      room.started = false;
+      room.ended = false;
+      room.game = null;
+      room.resultIds = {};
+      room.players.forEach(p => {
+        if (!p) return;
+        p.ready = false;
+        p.hp = 0;
+        p.maxhp = 0;
+        p.shields = 0;
+        p.cash = 0;
+        p.up = Array(UPS.length).fill(0);
+        p.purchased = Array(UPS.length).fill(0);
+        p.kills = 0;
+        p.damage = 0;
+      });
+      room.lastActive = Date.now();
+      broadcast(room, { type: 'lobby', state: lobbyState(room), restarted: true });
+      saveRooms();
+    }
+    return;
+  }
+
   if (msg.type === 'ready') {
     p.ready = msg.ready !== undefined ? !!msg.ready : !p.ready;
     if (msg.idToken) {
@@ -1672,6 +1743,7 @@ function onMessage(ws, raw) {
         p.firebaseUid = candidateUid;
       }
     }
+    if (msg.skin) p.skin = String(msg.skin).trim().slice(0, 32);
     if (msg.stats) p.stats = safeStats(msg.stats);
     if (msg.initialUpgrades) p.initialUpgrades = safeInitialUpgrades(msg.initialUpgrades);
     if (msg.profile || msg.permanentProfile) p.permanent = safeProfile(msg.profile || msg.permanentProfile, p.initialUpgrades);
