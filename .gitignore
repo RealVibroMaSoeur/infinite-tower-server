@@ -1,0 +1,7 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+data/active_rooms.json
+data/*.tmp
+.env
+.env.local
