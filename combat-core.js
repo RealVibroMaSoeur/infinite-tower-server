@@ -263,7 +263,7 @@
     ['Bounce Shot Chance', 300, 1.25, 'Offense', 40],
     ['Rapid Fire Chance', 300, 1.25, 'Offense', 50],
     ['Life on Wave End', 350, 1.25, 'Defense', 50],
-    ['Startup Cash', 350, 1.25, 'Economy'],
+    ['Startup Cash', 150, 1.25, 'Economy'],
     ['Life on Wave End (Run)', 350, 1.25, 'Defense', 100],
     ['Overcrit Chance', 400, 1.25, 'Offense', 40],
     ['Overcrit Damage', 500, 1.25, 'Offense', 40]
@@ -926,9 +926,9 @@
       rapidFireMultiplier: 1 + (wl(9) + ru(9) + lb('Rapid Fire', 9)) * 0.02,
       bounceCount: Math.min(5, Math.max(0, wl(10) + ru(10) + lb('Bounce Count', 10))),
       lifeOnWaveEnd: Math.min(0.5, Math.max(0, (wl(38) + lb('Life on Wave End', 38)) * 0.005)),
-      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 10,
+      startupCash: (wl(39) + wl(28) + lb('Startup Cash', 39)) * 100,
       overcritChance: Math.min(1.0, Math.max(0, (wl(41) * 0.025) + (lb('Overcrit Chance', 41) * 0.025) + (ru(41) * 0.025))),
-      overcritDamage: 2.0 + (wl(42) + lb('Overcrit Damage', 42) + ru(42)) * 0.10
+      overcritDamage: Math.min(6.0, 2.0 + (wl(42) + lb('Overcrit Damage', 42) + ru(42)) * 0.10)
     };
   }
 
@@ -956,7 +956,7 @@
     if (i === 36 && (effLv >= 40 || Number(effects.bounceChance) >= 1 - 1e-9)) return false;
     if (i === 37 && (effLv >= 40 || Number(effects.rapidFireChance) >= 1 - 1e-9)) return false;
     if (i === 41 && (effLv >= 40 || Number(effects.overcritChance) >= 1 - 1e-9)) return false;
-    if (i === 42 && effLv >= 40) return false;
+    if (i === 42 && (effLv >= 40 || Number(effects.overcritDamage) >= 6.0 - 1e-9)) return false;
     if (i >= 29 && i <= 32 && effLv + (Number(freeUpgradeLabLevel) || 0) * 0.5 >= 100) return false;
     return true;
   }

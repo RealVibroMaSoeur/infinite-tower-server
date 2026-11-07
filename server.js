@@ -1123,10 +1123,14 @@ function finish(room, reason) {
     ? 4999
     : Math.min(5000, rawWave);
 
-  // Modif #20: Shared CO-OP Rewards
+  // Modif #20: Shared CO-OP Rewards — Best team multiplier applied to all eligible players
   const activePlayers = room.players.filter(pl => pl && !pl.forfeited);
-  const avgCoinBonus = activePlayers.length > 0 ? (activePlayers.reduce((sum, pl) => sum + (pl.stats?.coinBonus || 1), 0) / activePlayers.length) : 1;
-  const avgXpBonus = activePlayers.length > 0 ? (activePlayers.reduce((sum, pl) => sum + (pl.stats?.xpBonus || 1), 0) / activePlayers.length) : 1;
+  const bestCoinBonus = activePlayers.length > 0
+    ? activePlayers.reduce((max, pl) => Math.max(max, Number(pl.stats?.coinBonus) || 1), 1)
+    : 1;
+  const bestXpBonus = activePlayers.length > 0
+    ? activePlayers.reduce((max, pl) => Math.max(max, Number(pl.stats?.xpBonus) || 1), 1)
+    : 1;
   const sharedGold = g ? g.gold : 0;
   const sharedXP = g ? g.xp : 0;
   const sharedDiamonds = g ? g.diamonds : 0;
@@ -1136,8 +1140,8 @@ function finish(room, reason) {
     wave: creditedWave,
     map: room.map || 1,
     diff: room.diff || 0,
-    coinBonus: avgCoinBonus,
-    xpBonus: avgXpBonus,
+    coinBonus: bestCoinBonus,
+    xpBonus: bestXpBonus,
     diamonds: sharedDiamonds
   });
 
